@@ -2,6 +2,16 @@
 
 ## v1.0.1 (2026-09-11)
 
+### 规范（对照 SDK 与宿主源码核查）
+
+- 日志统一改用宿主注入的 `ctx.logger`（自动路由到 `plugin.<plugin_id>`），
+  移除游离于宿主日志体系外的自定义 logger；
+- `chat.receive.after_process` 回收钩子改用 `HookOrder.LATE` 槽位，
+  避免干扰其他插件的 after 阶段处理；
+- `host_application.min_version` 提升至 1.2.4：`after_process` 钩点与
+  `ctx.db` update 能力在更早版本未经验证，宿主不支持时插件会注册失败，
+  必须如实声明兼容下限。
+
 ### 修复
 
 - **视觉描述"九宫格"化**：合成图顶部新增"动画分镜"说明条（`storyboard_caption`，默认开启），

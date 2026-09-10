@@ -25,7 +25,6 @@ import asyncio
 import base64
 import hashlib
 import io
-import logging
 import math
 from collections import OrderedDict
 from typing import Any, Dict, List, Literal, Optional
@@ -34,8 +33,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
-
-logger = logging.getLogger("plugin.gif_frames")
 
 SUPPORTED_CONFIG_VERSION = "1.0.0"
 
@@ -317,7 +314,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.after_process",
         mode=HookMode.BLOCKING,
-        order=HookOrder.EARLY,
+        order=HookOrder.LATE,
         name="gif_frame_ghost_cleanup",
         description="回收 GIF 分镜 ghost 组件，防止合成图进入聊天记录，并调度多帧描述搬运",
         timeout_ms=10000,
@@ -355,7 +352,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
         for merged_hash in removed_hashes:
             self._spawn_relocate_task(merged_hash)
-        logger.info(
+        self.ctx.logger.info(
             "[GIF合成] 已回收 %d 个分镜合成图组件，描述将在后台搬运到原图名下", len(removed_hashes)
         )
 
@@ -399,7 +396,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                         target = await self._db_get_image_record(orig_hash, image_type)
                         if target is not None and target.get("vlm_processed"):
                             await self._db_update_description(orig_hash, image_type, source_desc)
-                            logger.info(
+                            self.ctx.logger.info(
                                 "[GIF合成] 多帧动画描述已搬运至原图记录 %s（%s）",
                                 orig_hash[:12],
                                 image_type,
@@ -407,7 +404,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                             return
                 await asyncio.sleep(RELOCATE_POLL_INTERVAL_SECONDS)
 
-            logger.warning(
+            self.ctx.logger.warning(
                 "[GIF合成] 描述搬运超时放弃（宿主识别未完成或记录缺失）：merged=%s orig=%s",
                 merged_hash[:12],
                 orig_hash[:12],
@@ -426,7 +423,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 single_result=True,
             )
         except Exception as exc:  # noqa: BLE001 数据库不可达时静默放弃本轮
-            logger.debug("[GIF合成] 查询图片记录失败 hash=%s: %s", image_hash[:12], exc)
+            self.ctx.logger.debug("[GIF合成] 查询图片记录失败 hash=%s: %s", image_hash[:12], exc)
             return None
 
         if not isinstance(result, dict):
@@ -453,7 +450,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 filters={"image_hash": image_hash, "image_type": image_type},
             )
         except Exception as exc:  # noqa: BLE001 更新失败不影响消息链
-            logger.warning("[GIF合成] 更新原图描述失败 hash=%s: %s", image_hash[:12], exc)
+            self.ctx.logger.warning("[GIF合成] 更新原图描述失败 hash=%s: %s", image_hash[:12], exc)
 
     async def _process_component(self, comp: Any) -> List[Any]:
         """处理单个消息组件，返回替换后的组件列表（bypass 策略可能追加组件）。
@@ -495,7 +492,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 # after_process 阶段被回收，多帧描述由后台任务搬到原表情 hash 名下。
                 ghost = self._build_ghost(merged_hash, merged_b64)
                 self._ghost_records[merged_hash] = {"orig_hash": orig_hash, "kind": "emoji"}
-                logger.info(
+                self.ctx.logger.info(
                     "[GIF合成] 表情包旁路识别：原表情保留，追加合成图 %.1fKB", len(merged) / 1024
                 )
                 return [comp, ghost]
@@ -539,7 +536,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         try:
             merged = await asyncio.to_thread(self._merge_gif_frames, raw)
         except Exception as exc:  # noqa: BLE001 合成失败绝不能阻塞消息链
-            logger.warning("[GIF合成] 帧合成失败，原图原样放行: %s", exc)
+            self.ctx.logger.warning("[GIF合成] 帧合成失败，原图原样放行: %s", exc)
             return None
 
         if merged is None:
@@ -650,7 +647,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             canvas.save(buf, "JPEG", quality=jpeg_quality)
 
         merged = buf.getvalue()
-        logger.info(
+        self.ctx.logger.info(
             "[GIF合成] %d/%d 帧 -> %dx%d 网格图，%.1fKB -> %.1fKB（%s）",
             count,
             n_frames,
@@ -730,7 +727,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
     # ── 生命周期 ────────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
-        logger.info(
+        self.ctx.logger.info(
             "[GIF合成] 插件已加载 | 总开关: %s | 处理图片: %s | 表情包策略: %s | 最多 %s 帧 | 输出: %s",
             self._enabled(),
             bool(self._opt("merge", "process_image", True)),
@@ -743,11 +740,11 @@ class GifStoryboardPlugin(MaiBotPlugin):
         self._merge_cache.clear()
         self._ghost_records.clear()
         self._relocate_tasks.clear()
-        logger.info("[GIF合成] 插件已卸载")
+        self.ctx.logger.info("[GIF合成] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         self._merge_cache.clear()
-        logger.info("[GIF合成] 配置已更新（scope=%s version=%s），合成缓存已清空", scope, version)
+        self.ctx.logger.info("[GIF合成] 配置已更新（scope=%s version=%s），合成缓存已清空", scope, version)
 
 
 def create_plugin() -> MaiBotPlugin:
