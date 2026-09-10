@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "id": "github.elmeir.gif-storyboard",
   "name": "GIF 动图分镜（视觉增强）",
   "description": "在麦麦把 GIF 动图交给视觉模型之前，把动画的各帧均匀抽样并合成到同一张网格静态图上（可绘制帧序号），让视觉模型能看到动画的内容与时序，而不是只看到第一帧。只处理 GIF 魔数的多帧动图；普通图片组件原位替换，表情包组件默认走 bypass 旁路识别（表情库存原始 GIF 保真，另用追加的合成图组件让视觉模型看全多帧），也可选直接替换或不处理。挂载 chat.receive.before_process 钩子，宿主识别链路自动生效，不改宿主一行代码。",

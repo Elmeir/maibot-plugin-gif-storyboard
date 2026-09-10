@@ -17,6 +17,10 @@ emoji_strategy = "bypass" # 表情包组件（type=emoji）策略：
 max_frames = 9            # 最多抽取的帧数（按时序均匀抽样，9 = 3x3 网格）；帧越多图越大、token 越贵
 min_frames = 2            # 动画至少包含多少帧才触发合成；单帧 GIF 等价静态图，直接放行
 draw_frame_index = true   # 在每帧左上角绘制序号（1、2、3…），帮助视觉模型理解播放顺序
+storyboard_caption = true # 在合成图顶部绘制说明条，引导视觉模型把网格图理解为一段动画（而非"九宫格拼图"）；
+                          # 环境中无中文字体时自动改用英文说明
+clean_ghost_components = true # 识别完成后从消息中回收携带合成图的组件，防止九宫格进入聊天记录/WebUI；
+                              # 多帧描述会在后台搬运到原图名下。关闭后合成图随消息落库展示
 
 [output]
 output_format = "jpeg"    # 合成图格式：jpeg 体积小（推荐）；png 无损但明显更大

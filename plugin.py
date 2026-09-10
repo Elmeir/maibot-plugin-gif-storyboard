@@ -5,21 +5,20 @@
 否则大多数视觉模型遇到 image/gif 只能看到第一帧。
 
 实现方式（宿主源码级挂钩，不改宿主一行代码）：
-- 订阅宿主 ``chat.receive.before_process`` 钩子：该钩点允许改写序列化消息，
-  且宿主会用改写后的字典重建消息对象（PluginMessageUtils 反序列化），
-  因此后续的图片识别（ImageManager.get_image_description）与图片落库
-  全部自动使用合成后的图片；
-- 定位 image / emoji 组件的 ``binary_data_base64``，检测到 GIF 魔数
-  （GIF87a / GIF89a）且为多帧动画时，用 Pillow 解帧、均匀抽样
-  ``max_frames`` 帧、拼成网格静态图后原位替换；
-- 只对 GIF 魔数动图动手，其余格式零接触；普通图片组件（type=image，
-  群友发的 GIF 动图主要走这里）默认处理；表情包组件（type=emoji）默认
-  走 bypass 旁路识别——宿主表情链路"识别与存储共用同一个字节流"，直接
-  替换会让合成图落盘表情库（data/emoji）甚至被收藏发出，因此旁路模式下
-  原表情组件原样保留（表情库存原始 GIF，收藏/发送完全保真），另在其后
-  追加一个携带合成网格图的 image 组件，让视觉链路借道完成多帧识别；
-- 替换后无需手工改 hash：宿主 ByteComponent 在二进制非空时会按新字节
-  重算 SHA-256（插件同时主动写回，保持字典自洽）。
+- 订阅宿主 ``chat.receive.before_process`` 钩子：定位 image / emoji 组件的
+  ``binary_data_base64``，检测到 GIF 魔数（GIF87a / GIF89a）且为多帧动画时，
+  用 Pillow 解帧、均匀抽样 ``max_frames`` 帧、拼成网格静态图（顶部附"动画分镜"
+  说明条，引导视觉模型按动画而非拼图理解）；
+- 原图/原表情组件一律原样保留，合成图放进临时追加的 ghost image 组件：
+  宿主 ``process()`` 阶段会按组件二进制调度 VLM 识别（多帧网格图由此进入
+  视觉链路），同时原图走正常落盘（图片库/表情库/WebUI 全部保真）；
+- 订阅宿主 ``chat.receive.after_process`` 钩子：识别调度完成后回收全部 ghost
+  组件——消息里不再有合成图，聊天记录与 WebUI 不受污染；
+- 后台搬运任务：等宿主 VLM 写出合成图描述后，用 ctx.db 把多帧描述写到原图
+  hash 的 Images 记录名下，宿主的视觉占位刷新器（chat_history_refresher 按
+  hash 查库回填）会让麦麦上下文拿到完整的多帧动画描述；
+- 只对 GIF 魔数动图动手，其余格式零接触；表情包组件可选 replace 策略
+  （直接替换二进制，识别最直接但合成图会进表情库，由配置自担）。
 """
 
 import asyncio
@@ -48,6 +47,12 @@ MANAGED_COMPONENT_TYPES = ("image", "emoji")
 
 MERGE_CACHE_MAX_ENTRIES = 64
 """合成结果内存缓存上限（键=原图哈希+参数指纹，超出按最旧淘汰）。"""
+
+RELOCATE_TIMEOUT_SECONDS = 600.0
+"""描述搬运任务的最长等待时间（宿主后台 VLM 识别合成图的宽限期）。"""
+
+RELOCATE_POLL_INTERVAL_SECONDS = 5.0
+"""描述搬运任务的轮询间隔。"""
 
 
 # ─── 配置模型 ────────────────────────────────────────────────────────────────
@@ -137,6 +142,22 @@ class MergeSectionConfig(PluginConfigBase):
             "hint": "每帧左上角标 1、2、3…，视觉模型更容易按时序描述动画",
         },
     )
+    clean_ghost_components: bool = Field(
+        default=True,
+        description="识别完成后从消息中回收携带合成图的 ghost 组件，防止九宫格进入聊天记录/WebUI",
+        json_schema_extra={
+            "label": "回收合成图组件",
+            "hint": "依赖 after_process 钩子 + 描述搬运；关闭后合成图会随消息落库并在 WebUI 中显示",
+        },
+    )
+    storyboard_caption: bool = Field(
+        default=True,
+        description="在合成图顶部绘制一行说明文字，引导视觉模型把网格图理解为一段动画而不是一张拼图",
+        json_schema_extra={
+            "label": "动画分镜说明条",
+            "hint": "修复视觉模型把合成图描述成『九宫格动漫截图』的问题；环境中无中文字体时自动改用英文说明",
+        },
+    )
 
 
 class OutputSectionConfig(PluginConfigBase):
@@ -206,6 +227,11 @@ class GifStoryboardPlugin(MaiBotPlugin):
         super().__init__()
         # (原图 sha256 + 参数指纹) -> 合成图 bytes；OrderedDict 做 LRU 淘汰
         self._merge_cache: "OrderedDict[str, bytes]" = OrderedDict()
+        # 合成图 hash -> {"orig_hash": 原组件 hash, "kind": "image"|"emoji"}
+        # 用于 after_process 阶段识别并回收自家 ghost 组件，以及描述搬运
+        self._ghost_records: "Dict[str, Dict[str, str]]" = {}
+        # 已在跑的描述搬运任务（按合成图 hash 去重）
+        self._relocate_tasks: "set[str]" = set()
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -237,6 +263,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 ("merge", "max_frames", 9),
                 ("merge", "min_frames", 2),
                 ("merge", "draw_frame_index", True),
+                ("merge", "storyboard_caption", True),
                 ("output", "output_format", "jpeg"),
                 ("output", "jpeg_quality", 85),
                 ("output", "max_cell_size", 480),
@@ -251,7 +278,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         name="gif_frame_merge",
-        description="把 GIF 动图的各帧合成一张网格静态图，替换原图交给视觉模型",
+        description="把 GIF 动图各帧合成网格图，以 ghost 组件形式交给视觉链路（原图保留）",
         timeout_ms=10000,
         error_policy=ErrorPolicy.SKIP,
     )
@@ -287,6 +314,147 @@ class GifStoryboardPlugin(MaiBotPlugin):
         new_message["raw_message"] = new_components
         return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
+    @HookHandler(
+        "chat.receive.after_process",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        name="gif_frame_ghost_cleanup",
+        description="回收 GIF 分镜 ghost 组件，防止合成图进入聊天记录，并调度多帧描述搬运",
+        timeout_ms=10000,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def handle_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
+        """after 钩子：宿主 process() 已用合成图完成识别调度，此刻回收 ghost 组件。
+
+        消息中不再有携带合成图的组件，落库与 WebUI 展示只看得到原图/原表情；
+        多帧描述由后台任务搬运到原图 hash 名下，宿主的视觉占位刷新器
+        （chat_history_refresher 按 hash 查 Images 表）会自动读到它。
+        """
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+        if not bool(self._opt("merge", "clean_ghost_components", True)):
+            return {"action": "continue"}
+
+        components = message.get("raw_message")
+        if not isinstance(components, list) or not components:
+            return {"action": "continue"}
+
+        kept: List[Any] = []
+        removed_hashes: List[str] = []
+        for comp in components:
+            comp_hash = ""
+            if isinstance(comp, dict) and str(comp.get("type") or "").strip().lower() == "image":
+                comp_hash = str(comp.get("hash") or "").strip()
+            if comp_hash and comp_hash in self._ghost_records:
+                removed_hashes.append(comp_hash)
+                continue
+            kept.append(comp)
+
+        if not removed_hashes:
+            return {"action": "continue"}
+
+        for merged_hash in removed_hashes:
+            self._spawn_relocate_task(merged_hash)
+        logger.info(
+            "[GIF合成] 已回收 %d 个分镜合成图组件，描述将在后台搬运到原图名下", len(removed_hashes)
+        )
+
+        new_message = dict(message)
+        new_message["raw_message"] = kept
+        return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
+
+    def _spawn_relocate_task(self, merged_hash: str) -> None:
+        """按合成图 hash 去重后启动描述搬运后台任务。"""
+        if merged_hash in self._relocate_tasks:
+            return
+        self._relocate_tasks.add(merged_hash)
+        try:
+            asyncio.get_running_loop().create_task(self._relocate_description(merged_hash))
+        except RuntimeError:
+            self._relocate_tasks.discard(merged_hash)
+
+    async def _relocate_description(self, merged_hash: str) -> None:
+        """等待宿主后台 VLM 完成合成图识别，把多帧描述搬到原图 hash 名下。
+
+        - kind=image：等宿主为原图建好 Images 记录并完成首帧识别（vlm_processed）；
+        - kind=emoji：等 emoji_manager 写入原表情记录后覆盖为多帧描述；
+        - 超时放弃时行为退化为宿主原生识别（原图/首帧描述），不影响消息链。
+        """
+        info = self._ghost_records.pop(merged_hash, None)
+        try:
+            if not info:
+                return
+            orig_hash = str(info.get("orig_hash") or "")
+            image_type = str(info.get("kind") or "image")
+            if not orig_hash:
+                return
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + RELOCATE_TIMEOUT_SECONDS
+            while loop.time() < deadline:
+                source = await self._db_get_image_record(merged_hash, "image")
+                if source and source.get("vlm_processed"):
+                    source_desc = str(source.get("description") or "").strip()
+                    if source_desc:
+                        target = await self._db_get_image_record(orig_hash, image_type)
+                        if target is not None and target.get("vlm_processed"):
+                            await self._db_update_description(orig_hash, image_type, source_desc)
+                            logger.info(
+                                "[GIF合成] 多帧动画描述已搬运至原图记录 %s（%s）",
+                                orig_hash[:12],
+                                image_type,
+                            )
+                            return
+                await asyncio.sleep(RELOCATE_POLL_INTERVAL_SECONDS)
+
+            logger.warning(
+                "[GIF合成] 描述搬运超时放弃（宿主识别未完成或记录缺失）：merged=%s orig=%s",
+                merged_hash[:12],
+                orig_hash[:12],
+            )
+        finally:
+            self._relocate_tasks.discard(merged_hash)
+
+    async def _db_get_image_record(self, image_hash: str, image_type: str) -> Optional[Dict[str, Any]]:
+        """按 hash + 类型查询宿主 Images 表记录，兼容不同的返回包装结构。"""
+        try:
+            result = await self.ctx.db.query(
+                model_name="Images",
+                query_type="get",
+                filters={"image_hash": image_hash, "image_type": image_type},
+                limit=1,
+                single_result=True,
+            )
+        except Exception as exc:  # noqa: BLE001 数据库不可达时静默放弃本轮
+            logger.debug("[GIF合成] 查询图片记录失败 hash=%s: %s", image_hash[:12], exc)
+            return None
+
+        if not isinstance(result, dict):
+            return None
+        if result.get("success") is False:
+            return None
+        if "description" in result:
+            return result
+        for key in ("data", "result", "items", "records"):
+            inner = result.get(key)
+            if isinstance(inner, dict) and "description" in inner:
+                return inner
+            if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+                return inner[0]
+        return None
+
+    async def _db_update_description(self, image_hash: str, image_type: str, description: str) -> None:
+        """把多帧描述写入原图 hash 的 Images 记录（保持 vlm_processed=True）。"""
+        try:
+            await self.ctx.db.query(
+                model_name="Images",
+                query_type="update",
+                data={"description": description, "vlm_processed": True},
+                filters={"image_hash": image_hash, "image_type": image_type},
+            )
+        except Exception as exc:  # noqa: BLE001 更新失败不影响消息链
+            logger.warning("[GIF合成] 更新原图描述失败 hash=%s: %s", image_hash[:12], exc)
+
     async def _process_component(self, comp: Any) -> List[Any]:
         """处理单个消息组件，返回替换后的组件列表（bypass 策略可能追加组件）。
 
@@ -317,20 +485,16 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
         merged_b64 = base64.b64encode(merged).decode("ascii")
         merged_hash = hashlib.sha256(merged).hexdigest()
+        orig_hash = str(comp.get("hash") or "").strip() or hashlib.sha256(raw).hexdigest()
 
         if comp_type == "emoji":
             strategy = str(self._opt("merge", "emoji_strategy", "bypass") or "bypass").lower()
             if strategy == "bypass":
                 # 原表情组件原样保留（表情库存原始 GIF，收藏/发送保真），
-                # 追加一个携带合成网格图的 image 组件旁路识别：视觉链路走
-                # 图片描述（落 data/images，不碰表情库），麦麦上下文里会同时
-                # 出现 [表情包] 与 [图片: 多帧动画描述]。
-                ghost = {
-                    "type": "image",
-                    "data": "",  # content 留空，交给宿主视觉链路生成描述
-                    "hash": merged_hash,
-                    "binary_data_base64": merged_b64,
-                }
+                # 追加一个携带合成网格图的 ghost image 组件旁路识别；该组件在
+                # after_process 阶段被回收，多帧描述由后台任务搬到原表情 hash 名下。
+                ghost = self._build_ghost(merged_hash, merged_b64)
+                self._ghost_records[merged_hash] = {"orig_hash": orig_hash, "kind": "emoji"}
                 logger.info(
                     "[GIF合成] 表情包旁路识别：原表情保留，追加合成图 %.1fKB", len(merged) / 1024
                 )
@@ -341,11 +505,22 @@ class GifStoryboardPlugin(MaiBotPlugin):
             new_comp["hash"] = merged_hash
             return [new_comp]
 
-        # image：原位替换二进制
-        new_comp = dict(comp)
-        new_comp["binary_data_base64"] = merged_b64
-        new_comp["hash"] = merged_hash
-        return [new_comp]
+        # image：ghost 模式——原图组件原样保留（落库/WebUI 显示原图），另追加
+        # 携带合成网格图的 ghost 组件；ghost 仅在宿主 process() 识别阶段存在，
+        # after_process 阶段被回收，多帧描述由后台任务搬到原图 hash 名下。
+        ghost = self._build_ghost(merged_hash, merged_b64)
+        self._ghost_records[merged_hash] = {"orig_hash": orig_hash, "kind": "image"}
+        return [comp, ghost]
+
+    @staticmethod
+    def _build_ghost(merged_hash: str, merged_b64: str) -> Dict[str, str]:
+        """构造携带合成网格图的 ghost 组件（content 留空交给宿主视觉链路）。"""
+        return {
+            "type": "image",
+            "data": "",
+            "hash": merged_hash,
+            "binary_data_base64": merged_b64,
+        }
 
     @staticmethod
     def _is_gif(data: bytes) -> bool:
@@ -430,8 +605,28 @@ class GifStoryboardPlugin(MaiBotPlugin):
             cell_w = max(1, round(cell_w * scale))
             cell_h = max(1, round(cell_h * scale))
 
-        canvas = Image.new("RGB", (cols * cell_w + gap * (cols + 1), rows * cell_h + gap * (rows + 1)), (255, 255, 255))
+        # 顶部说明条：引导视觉模型把网格图理解为"一段动画"而非"一张拼图"
+        caption_text = ""
+        caption_font = None
+        caption_h = 0
+        if bool(self._opt("merge", "storyboard_caption", True)):
+            canvas_w = cols * cell_w + gap * (cols + 1)
+            caption_font, has_cjk = self._load_caption_font(max(14, min(28, canvas_w // 36)))
+            caption_text = self._caption_text(count, has_cjk)
+            try:
+                bbox = caption_font.getbbox(caption_text)
+                caption_h = (bbox[3] - bbox[1]) + 12
+            except Exception:
+                caption_h = 0
+
+        canvas = Image.new(
+            "RGB",
+            (cols * cell_w + gap * (cols + 1), caption_h + rows * cell_h + gap * (rows + 1)),
+            (255, 255, 255),
+        )
         draw = ImageDraw.Draw(canvas)
+        if caption_h and caption_font is not None:
+            draw.text((gap + 2, 4), caption_text, font=caption_font, fill=(17, 17, 17))
         font = self._load_font(max(12, min(cell_w, cell_h) // 10)) if draw_index else None
 
         for i, frame in enumerate(frames):
@@ -442,7 +637,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             if frame_scale < 1.0:
                 frame = frame.resize((max(1, round(fw * frame_scale)), max(1, round(fh * frame_scale))), Image.LANCZOS)
             x = gap + col * (cell_w + gap) + (cell_w - frame.width) // 2
-            y = gap + row * (cell_h + gap) + (cell_h - frame.height) // 2
+            y = caption_h + gap + row * (cell_h + gap) + (cell_h - frame.height) // 2
 
             canvas.paste(frame, (x, y), frame)  # 第三参数=alpha 遮罩
             if font is not None:
@@ -489,6 +684,49 @@ class GifStoryboardPlugin(MaiBotPlugin):
         except TypeError:
             return ImageFont.load_default()
 
+    _CJK_FONT_CANDIDATES: "tuple[str, ...]" = (
+        # Windows
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        # Linux（麦麦常见部署环境）
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        # macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+    )
+
+    @classmethod
+    def _load_caption_font(cls, size: int) -> "tuple[Any, bool]":
+        """加载说明条字体：优先系统中文字体，找不到退回 Pillow 内置字体（仅拉丁）。
+
+        Returns:
+            (字体对象, 是否中文字体)。
+        """
+        for path in cls._CJK_FONT_CANDIDATES:
+            try:
+                return ImageFont.truetype(path, size=size), True
+            except Exception:  # noqa: BLE001 字体缺失/格式不支持一律尝试下一个
+                continue
+        return cls._load_font(size), False
+
+    @staticmethod
+    def _caption_text(count: int, has_cjk: bool) -> str:
+        """说明条文案：明确告诉视觉模型这是同一段动画的时序帧，而非一张拼图。"""
+        if has_cjk:
+            return (
+                f"动图分镜：这是同一段动画按时序抽取的 {count} 帧，"
+                f"请按序号 1→{count} 的顺序把它理解为一个连续的动画过程来描述"
+            )
+        return (
+            f"Storyboard: {count} frames of the SAME GIF animation in chronological order — "
+            f"describe it as one continuous animation, following the numbers"
+        )
+
     # ── 生命周期 ────────────────────────────────────────────────────────
 
     async def on_load(self) -> None:
@@ -503,6 +741,8 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
     async def on_unload(self) -> None:
         self._merge_cache.clear()
+        self._ghost_records.clear()
+        self._relocate_tasks.clear()
         logger.info("[GIF合成] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
