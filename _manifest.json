@@ -1,0 +1,47 @@
+{
+  "manifest_version": 2,
+  "version": "1.0.0",
+  "id": "github.elmeir.gif-storyboard",
+  "name": "GIF 动图分镜（视觉增强）",
+  "description": "在麦麦把 GIF 动图交给视觉模型之前，把动画的各帧均匀抽样并合成到同一张网格静态图上（可绘制帧序号），让视觉模型能看到动画的内容与时序，而不是只看到第一帧。只处理 GIF 魔数的多帧动图；普通图片组件原位替换，表情包组件默认走 bypass 旁路识别（表情库存原始 GIF 保真，另用追加的合成图组件让视觉模型看全多帧），也可选直接替换或不处理。挂载 chat.receive.before_process 钩子，宿主识别链路自动生效，不改宿主一行代码。",
+  "author": {
+    "name": "Elmeir",
+    "url": "https://github.com/Elmeir"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/Elmeir/maibot-plugin-gif-storyboard",
+    "homepage": "https://github.com/Elmeir/maibot-plugin-gif-storyboard",
+    "documentation": "https://github.com/Elmeir/maibot-plugin-gif-storyboard#readme",
+    "issues": "https://github.com/Elmeir/maibot-plugin-gif-storyboard/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=10.0.0"
+    }
+  ],
+  "capabilities": [],
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "emoji",
+      "value": "🎞️"
+    }
+  },
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}

@@ -1,0 +1,25 @@
+# GIF 动图分镜插件配置模板
+# 复制本文件为 config.toml（麦麦首次加载插件也会自动生成）；所有项都有默认值，一般无需修改。
+# 说明：配置按用途分为多个页签（插件/帧合成/输出图像），本文件用 [段名] 对应。
+
+[plugin]
+enabled = true            # 插件总开关；关闭后 GIF 一律原样交给视觉模型
+config_version = "1.0.0"  # 勿改
+
+[merge]
+process_image = true      # 处理普通图片组件（type=image）中的 GIF 动图
+emoji_strategy = "bypass" # 表情包组件（type=emoji）策略：
+                          #   bypass（推荐）= 原表情保留（表情库存原始 GIF，收藏/发送保真），
+                          #                  另追加合成图组件旁路识别，VLM 能看全多帧；
+                          #   replace = 直接替换表情二进制，识别最直接，但合成图会落盘表情库
+                          #             （data/emoji）甚至被收藏发出，原始 GIF 丢失；
+                          #   off     = 不处理表情包，识别退回宿主原生行为（GIF 取首帧）
+max_frames = 9            # 最多抽取的帧数（按时序均匀抽样，9 = 3x3 网格）；帧越多图越大、token 越贵
+min_frames = 2            # 动画至少包含多少帧才触发合成；单帧 GIF 等价静态图，直接放行
+draw_frame_index = true   # 在每帧左上角绘制序号（1、2、3…），帮助视觉模型理解播放顺序
+
+[output]
+output_format = "jpeg"    # 合成图格式：jpeg 体积小（推荐）；png 无损但明显更大
+jpeg_quality = 85         # JPEG 质量 50~95（仅 jpeg 格式生效）
+max_cell_size = 480       # 网格中每帧格子的最长边像素上限，帧原图更大时等比缩小
+grid_gap = 4              # 帧与帧之间的白色间隔像素
