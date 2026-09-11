@@ -567,6 +567,59 @@ def main() -> int:
     check("清晰度抽帧保持时序", picked == sorted(picked), str(picked))
     check("清晰度抽帧覆盖首尾", picked[0] == 0 and picked[-1] == 23, str(picked))
 
+    # 回归（v1.1.3）：此前漏导入 ImageFilter，_frame_sharpness 抛 NameError 被吞掉、
+    # 每帧清晰度恒为 0，清晰度选帧静默退化为"每段取首个候选"。两条断言分别堵住：
+    # 1) 清晰度计算本身可用；2) 选帧结果真实受清晰度影响（而非恰好由防重分支救回）。
+    flat_frame = Image.new("L", (64, 64), 120)
+    edge_frame = Image.new("L", (64, 64), 255)
+    ImageDraw.Draw(edge_frame).rectangle((8, 8, 55, 55), fill=0)
+    s_edge = plugin_module.GifStoryboardPlugin._frame_sharpness(edge_frame)
+    s_flat = plugin_module.GifStoryboardPlugin._frame_sharpness(flat_frame)
+    check(
+        "帧清晰度计算可用（边缘帧 > 平坦帧且大于 0）",
+        s_edge > 0 and s_edge > s_flat,
+        f"edge={s_edge:.1f} flat={s_flat:.1f}",
+    )
+
+    def discriminative_gif() -> bytes:
+        """构造使"清晰度选帧"与"防重兜底"结论分离的素材：
+        seg1 候选 = [第 4 帧（水平渐变：边缘响应极低、但 dhash 与 prev 距离大，
+                     不会被防重分支改选），第 6 帧（棋盘格，边缘最丰富）]。
+        清晰度生效 → 选 6；清晰度失效（恒 0）→ 按首候选选 4。"""
+        frames = []
+        for i in range(8):
+            if i == 0:
+                img = Image.new("RGB", (64, 64), (0, 0, 0))
+                ImageDraw.Draw(img).rectangle((0, 0, 31, 63), fill=(255, 255, 255))  # 左白右黑（dhash 全 1，远离纯灰帧）
+            elif i == 4:
+                img = Image.new("RGB", (64, 64), (255, 255, 255))
+                for x in range(64):
+                    val = 255 - round(x * 255 / 63)  # 水平渐变：边缘响应低、dhash 与纯灰帧差异大
+                    ImageDraw.Draw(img).line((x, 0, x, 63), fill=(val, val, val))
+            elif i == 6:
+                img = Image.new("RGB", (64, 64), (0, 0, 0))
+                for by in range(8):
+                    for bx in range(8):
+                        if (bx + by) % 2 == 0:
+                            ImageDraw.Draw(img).rectangle(
+                                (bx * 8, by * 8, bx * 8 + 7, by * 8 + 7), fill=(255, 255, 255)
+                            )
+            else:
+                img = Image.new("RGB", (64, 64), (120, 120, 120))
+                img.putpixel((i % 64, 0), (121, 121, 121))  # 1px 差异保多帧
+            frames.append(img)
+        buf = io.BytesIO()
+        frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], duration=100)
+        return buf.getvalue()
+
+    with Image.open(io.BytesIO(discriminative_gif())) as im_disc:
+        picked_disc = plugin_module.GifStoryboardPlugin._pick_frame_indices(im_disc, 8, 4)
+    check(
+        "清晰度真实参与选帧（seg1 选中棋盘格而非首候选渐变帧）",
+        picked_disc == [0, 1, 6, 7],
+        str(picked_disc),
+    )
+
     print()
     if failures:
         print(f"自检未通过：{len(failures)} 项 — {failures}")

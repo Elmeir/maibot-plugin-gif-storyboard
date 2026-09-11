@@ -1,24 +1,20 @@
 """GIF 动图分镜插件（GIF Storyboard）
 
-在麦麦把 GIF 动图交给视觉模型之前，把动画的各个帧合成到同一张静态图上
-（均匀抽样 + 网格排布，可绘制帧序号），让视觉模型能"看到"动图的内容与时序——
-否则大多数视觉模型遇到 image/gif 只能看到第一帧。
+在麦麦把 GIF 动图交给视觉模型之前，把动画各帧按时序抽帧并合成到同一张
+网格静态图上（带帧序号与说明条），让视觉模型看到动画的完整内容与时序，
+而不是只看到第一帧。
 
-实现方式（宿主源码级挂钩，不改宿主一行代码）：
-- 订阅宿主 ``chat.receive.before_process`` 钩子：定位 image / emoji 组件的
-  ``binary_data_base64``，检测到 GIF 魔数（GIF87a / GIF89a）且为多帧动画时，
-  用 Pillow 解帧、均匀抽样 ``max_frames`` 帧、拼成网格静态图（顶部附"动画分镜"
-  说明条，引导视觉模型按动画而非拼图理解）；
-- 原图/原表情组件一律原样保留，合成图放进临时追加的 ghost image 组件：
-  宿主 ``process()`` 阶段会按组件二进制调度 VLM 识别（多帧网格图由此进入
-  视觉链路），同时原图走正常落盘（图片库/表情库/WebUI 全部保真）；
-- 订阅宿主 ``chat.receive.after_process`` 钩子：识别调度完成后回收全部 ghost
-  组件——消息里不再有合成图，聊天记录与 WebUI 不受污染；
-- 后台搬运任务：等宿主 VLM 写出合成图描述后，用 ctx.db 把多帧描述写到原图
-  hash 的 Images 记录名下，宿主的视觉占位刷新器（chat_history_refresher 按
-  hash 查库回填）会让麦麦上下文拿到完整的多帧动画描述；
-- 只对 GIF 魔数动图动手，其余格式零接触；表情包组件可选 replace 策略
-  （直接替换二进制，识别最直接但合成图会进表情库，由配置自担）。
+实现（挂在宿主钩子上，不改宿主一行代码）：
+- ``chat.receive.before_process``：检测 GIF 魔数，多帧动画——图片组件
+  临时替换为合成图（原图字节暂存插件内部登记表，按"组件索引+hash"登记）；
+  表情组件按 emoji_strategy 配置处理（bypass 追加 ghost 组件 / replace / off）；
+- ``chat.receive.after_process``：落库前用暂存字节恢复被替换的组件、
+  回收表情 ghost，并调度后台描述搬运任务；
+- 描述搬运：等宿主 VLM 写出合成图描述后，用 ctx.db 写回原图 hash 的
+  Images 记录，宿主视觉占位刷新器自动回填进麦麦上下文；
+  同图重发走"已就绪描述快速路径"，宿主直接跳过识别。
+
+只对 GIF 魔数动图动手；任何环节失败一律原样放行，绝不阻塞消息链。
 """
 
 import asyncio
@@ -29,7 +25,7 @@ import math
 from collections import OrderedDict
 from typing import Any, Dict, List, Literal, Optional
 
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageStat
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder

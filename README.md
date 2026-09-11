@@ -48,7 +48,7 @@ GIF 原样进入这条链路时，**大多数视觉模型对 `image/gif` 只取�
 
 ```bash
 cd /你的部署目录/plugins        # 例如 /opt/MaiBot/plugins
-git clone <本仓库地址> maibot-plugin-gif-storyboard
+git clone https://github.com/Elmeir/maibot-plugin-gif-storyboard.git
 # 重启麦麦（systemctl restart xxx / docker compose restart / 重启 bot.py）
 ```
 
@@ -56,7 +56,7 @@ git clone <本仓库地址> maibot-plugin-gif-storyboard
 
 依赖只有 Pillow（`Pillow>=10.0.0`，见 requirements.txt；宿主环境一般已自带）。
 
-重启后在 WebUI 插件页找到「GIF 动图帧合成（视觉增强）」确认已启用。所有配置项都在插件面板里，均有中文标签与说明，通常保持默认即可。
+重启后在 WebUI 插件页找到「GIF 动图分镜（视觉增强）」确认已启用。所有配置项都在插件面板里，均有中文标签与说明，通常保持默认即可。
 
 ## 配置说明
 
@@ -70,6 +70,7 @@ git clone <本仓库地址> maibot-plugin-gif-storyboard
 | 最少帧数 | 2 | 帧数不足视为静态图，原样放行 |
 | 自适应帧数 | 开 | 按动画运动量自动在最少~最多帧数之间调节实际抽帧数：简单循环动画少抽（省 token），动作丰富、帧数多的多抽（保证证据）；调节结果记录在日志 |
 | 绘制帧序号 | 开 | 每帧左上角标 1、2、3…，帮助 VLM 理解播放顺序 |
+| 落库前恢复原图 | 开 | 识别完成后把替换组件恢复为原图、回收表情 ghost，防止合成图进入聊天记录/WebUI |
 
 ### 表情包策略怎么选
 
