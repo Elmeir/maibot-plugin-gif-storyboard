@@ -3,3 +3,6 @@ config.toml
 
 __pycache__/
 *.pyc
+# 本地测试素材与预览产物  
+*.gif  
+.preview/ 

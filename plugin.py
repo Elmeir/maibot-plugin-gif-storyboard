@@ -29,7 +29,7 @@ import math
 from collections import OrderedDict
 from typing import Any, Dict, List, Literal, Optional
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
@@ -50,6 +50,18 @@ RELOCATE_TIMEOUT_SECONDS = 600.0
 
 RELOCATE_POLL_INTERVAL_SECONDS = 5.0
 """描述搬运任务的轮询间隔。"""
+
+ORIGINAL_BYTES_CACHE_MAX_ENTRIES = 16
+"""替换窗口内暂存原图字节的缓存上限（key=orig_hash）。
+
+before_process 把组件二进制替换为合成图（让宿主识别多帧），after_process
+在落库前用这里暂存的原图字节恢复组件。条目生命周期只有一次消息处理
+（几秒），并发 GIF 数量通常为个位数；超出上限时放弃替换（原样放行），
+避免原图字节因缓存淘汰而丢失导致合成图落库。
+"""
+
+DHASH_DUPLICATE_DISTANCE = 6
+"""感知哈希（64bit）汉明距离低于该值时，视为与上一选中帧"几乎相同"。"""
 
 
 # ─── 配置模型 ────────────────────────────────────────────────────────────────
@@ -131,6 +143,17 @@ class MergeSectionConfig(PluginConfigBase):
             "hint": "帧数不足该值的 GIF 视为静态图，原样放行",
         },
     )
+    adaptive_frames: bool = Field(
+        default=True,
+        description=(
+            "根据源动画的运动量与帧数，自动在『最少帧数~最多帧数』之间决定实际抽帧数："
+            "画面几乎静止/循环重复的简单动画少抽帧（省 token），运动丰富、帧数多的动画多抽帧（保证证据）"
+        ),
+        json_schema_extra={
+            "label": "自适应帧数",
+            "hint": "按动画运动量自动调节实际帧数；关闭则始终抽『最多帧数』",
+        },
+    )
     draw_frame_index: bool = Field(
         default=True,
         description="在每帧左上角绘制序号，帮助视觉模型理解播放顺序",
@@ -141,10 +164,10 @@ class MergeSectionConfig(PluginConfigBase):
     )
     clean_ghost_components: bool = Field(
         default=True,
-        description="识别完成后从消息中回收携带合成图的 ghost 组件，防止九宫格进入聊天记录/WebUI",
+        description="识别完成后恢复原图组件（图片 GIF）并回收表情旁路的 ghost 组件，防止合成图进入聊天记录/WebUI",
         json_schema_extra={
-            "label": "回收合成图组件",
-            "hint": "依赖 after_process 钩子 + 描述搬运；关闭后合成图会随消息落库并在 WebUI 中显示",
+            "label": "落库前恢复原图",
+            "hint": "依赖 after_process 钩子 + 描述搬运；关闭后消息会以合成图落库并在 WebUI 中显示九宫格",
         },
     )
     storyboard_caption: bool = Field(
@@ -224,11 +247,30 @@ class GifStoryboardPlugin(MaiBotPlugin):
         super().__init__()
         # (原图 sha256 + 参数指纹) -> 合成图 bytes；OrderedDict 做 LRU 淘汰
         self._merge_cache: "OrderedDict[str, bytes]" = OrderedDict()
-        # 合成图 hash -> {"orig_hash": 原组件 hash, "kind": "image"|"emoji"}
-        # 用于 after_process 阶段识别并回收自家 ghost 组件，以及描述搬运
-        self._ghost_records: "Dict[str, Dict[str, str]]" = {}
+        # 替换窗口内暂存的原图字节（key=orig_hash），after_process 恢复组件后删除
+        self._original_bytes: "OrderedDict[str, bytes]" = OrderedDict()
+        # 组件索引 -> (合成图 hash, 原图 hash)：after_process 按"索引 + hash"
+        # 精确恢复被替换的组件。不要把恢复信息写进组件本身——宿主钩子之间
+        # 会做序列化往返，组件对象上的未知字段会被丢弃。
+        self._replaced_index: "OrderedDict[int, tuple[str, str]]" = OrderedDict()
+        # 表情旁路 ghost（key=合成图 hash -> 原表情 hash）：after_process 回收
+        self._emoji_ghosts: "Dict[str, str]" = {}
+        # 描述搬运映射（key=合成图 hash -> (image_type, 原图/原表情 hash)）
+        self._ghost_records: "Dict[str, tuple[str, str]]" = {}
         # 已在跑的描述搬运任务（按合成图 hash 去重）
         self._relocate_tasks: "set[str]" = set()
+        # 数据库能力不可用时的告警去重标志（避免每轮轮询刷屏）
+        self._db_warned: bool = False
+
+    @staticmethod
+    def _b64_decode(data: Any) -> bytes:
+        """组件二进制 base64 解码，失败返回空字节串。"""
+        if not isinstance(data, str) or not data:
+            return b""
+        try:
+            return base64.b64decode(data)
+        except Exception:
+            return b""
 
     # ── 配置读取 ────────────────────────────────────────────────────────
 
@@ -259,6 +301,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             for section, key, default in (
                 ("merge", "max_frames", 9),
                 ("merge", "min_frames", 2),
+                ("merge", "adaptive_frames", True),
                 ("merge", "draw_frame_index", True),
                 ("merge", "storyboard_caption", True),
                 ("output", "output_format", "jpeg"),
@@ -273,14 +316,20 @@ class GifStoryboardPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.receive.before_process",
         mode=HookMode.BLOCKING,
-        order=HookOrder.EARLY,
+        order=HookOrder.LATE,
         name="gif_frame_merge",
         description="把 GIF 动图各帧合成网格图，以 ghost 组件形式交给视觉链路（原图保留）",
         timeout_ms=10000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_before_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
-        """入站钩子：消息里的 GIF 动图原位替换为多帧合成图。"""
+        """入站钩子：消息里的 GIF 动图原位替换为多帧合成图。
+
+        使用 LATE 槽位：排在消息防抖类插件（在 NORMAL 槽阻塞窗口并合并消息）
+        之后，看到的是防抖放行后的最终消息——防抖窗口内并入的第 2..N 条消息
+        的 GIF 也能被分镜处理，且被防抖 abort 的消息不会再触发本插件
+        （避免登记永远不会被回收的 ghost）。
+        """
         if not self._enabled() or not isinstance(message, dict):
             return {"action": "continue"}
 
@@ -298,11 +347,40 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
         new_components: List[Any] = []
         changed = False
-        for comp in components:
+        for idx, comp in enumerate(components):
             results = await self._process_component(comp)
-            if len(results) != 1 or results[0] is not comp:
-                changed = True
+            if len(results) == 1 and results[0] is comp:
+                new_components.append(comp)
+                continue
+            changed = True
+
+            comp_hash = str(comp.get("hash") or "").strip()
+            result = results[0]
+            result_hash = str(result.get("hash") or "").strip()
+
+            if len(results) == 1 and comp_hash and result_hash and result_hash != comp_hash:
+                # image 替换模式：按组件索引登记，after_process 据此恢复原图。
+                # 登记信息放在插件内部而非组件字段——宿主钩子间的序列化往返
+                # 会丢弃组件对象上的未知字段。
+                orig_bytes = self._b64_decode(comp.get("binary_data_base64"))
+                if orig_bytes:
+                    self._original_bytes[comp_hash] = orig_bytes
+                    self._original_bytes.move_to_end(comp_hash)
+                    while len(self._original_bytes) > ORIGINAL_BYTES_CACHE_MAX_ENTRIES:
+                        self._original_bytes.popitem(last=False)
+                self._replaced_index[idx] = (result_hash, comp_hash)
+                self._ghost_records[result_hash] = ("image", comp_hash)
+            elif len(results) == 2:
+                # 表情 bypass：第二个组件是 ghost，after_process 阶段回收
+                ghost_hash = str(results[1].get("hash") or "").strip()
+                if ghost_hash:
+                    self._emoji_ghosts[ghost_hash] = comp_hash
+                    self._ghost_records[ghost_hash] = ("emoji", comp_hash)
             new_components.extend(results)
+
+        # 防御：索引登记只服务于紧随其后的一条消息，避免异常路径残留累积
+        while len(self._replaced_index) > ORIGINAL_BYTES_CACHE_MAX_ENTRIES * 4:
+            self._replaced_index.popitem(last=False)
 
         if not changed:
             return {"action": "continue"}
@@ -321,15 +399,21 @@ class GifStoryboardPlugin(MaiBotPlugin):
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
-        """after 钩子：宿主 process() 已用合成图完成识别调度，此刻回收 ghost 组件。
+        """after 钩子：宿主 process() 已完成识别调度，此刻做两件事——
 
-        消息中不再有携带合成图的组件，落库与 WebUI 展示只看得到原图/原表情；
-        多帧描述由后台任务搬运到原图 hash 名下，宿主的视觉占位刷新器
-        （chat_history_refresher 按 hash 查 Images 表）会自动读到它。
+        1. 替换模式：按"组件索引 + hash"精确匹配 before_process 替换过的组件，
+           用暂存的原图字节恢复（二进制与 hash），随后的消息落库按原图 hash
+           保存文件与记录，图片库/WebUI 全部保真；此时原图记录尚未被宿主识别
+           （不存在首帧描述），搬运任务把合成图的多帧描述写到原图 hash 名下
+           后，刷新器即可安全回填；
+        2. 表情 bypass：按 hash 回收追加的 ghost 组件，多帧描述由后台任务搬到
+           原表情 hash 名下。
         """
         if not isinstance(message, dict):
             return {"action": "continue"}
         if not bool(self._opt("merge", "clean_ghost_components", True)):
+            self._replaced_index.clear()
+            self._emoji_ghosts.clear()
             return {"action": "continue"}
 
         components = message.get("raw_message")
@@ -337,71 +421,95 @@ class GifStoryboardPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         kept: List[Any] = []
-        removed_hashes: List[str] = []
-        for comp in components:
-            comp_hash = ""
-            if isinstance(comp, dict) and str(comp.get("type") or "").strip().lower() == "image":
-                comp_hash = str(comp.get("hash") or "").strip()
-            if comp_hash and comp_hash in self._ghost_records:
-                removed_hashes.append(comp_hash)
+        handled: List[tuple[str, str]] = []  # (合成图 hash, 原图/原表情 hash)
+        for idx, comp in enumerate(components):
+            comp_hash = str(comp.get("hash") or "").strip() if isinstance(comp, dict) else ""
+
+            if idx in self._replaced_index:
+                merged_hash, orig_hash = self._replaced_index[idx]
+                if comp_hash != merged_hash:
+                    # 组件列表被其他环节改动导致索引错位：放弃恢复（保持合成图），
+                    # 避免把原图字节写错到别的组件上。
+                    self.ctx.logger.warning(
+                        "[GIF合成] 替换组件索引错位（hash 不匹配），放弃恢复：idx=%s hash=%s",
+                        idx,
+                        comp_hash[:12],
+                    )
+                    self._replaced_index.pop(idx, None)
+                    kept.append(comp)
+                    continue
+                self._replaced_index.pop(idx, None)
+                restored = self._restore_replaced_component(comp, orig_hash)
+                # 恢复失败（暂存字节缺失）时组件保持合成图状态，但保留组件本体
+                kept.append(restored if restored is not None else comp)
+                handled.append((merged_hash, orig_hash))
                 continue
+
+            if comp_hash and comp_hash in self._emoji_ghosts:
+                orig_hash = self._emoji_ghosts.pop(comp_hash, "")
+                handled.append((comp_hash, orig_hash))
+                continue
+
             kept.append(comp)
 
-        if not removed_hashes:
+        if not handled:
             return {"action": "continue"}
 
-        for merged_hash in removed_hashes:
-            self._spawn_relocate_task(merged_hash)
+        # 恢复/回收全部完成后统一清理暂存的原图字节（同 hash 多组件共用一份）
+        for merged_hash, orig_hash in handled:
+            image_type = str(self._ghost_records.pop(merged_hash, ("image", ""))[0] or "image")
+            self._original_bytes.pop(orig_hash, None)
+            self._spawn_relocate_task(merged_hash, image_type, orig_hash)
         self.ctx.logger.info(
-            "[GIF合成] 已回收 %d 个分镜合成图组件，描述将在后台搬运到原图名下", len(removed_hashes)
+            "[GIF合成] 已处理 %d 个组件（恢复原图/回收合成图），多帧描述将在后台搬运",
+            len(handled),
         )
 
         new_message = dict(message)
         new_message["raw_message"] = kept
         return {"action": "continue", "modified_kwargs": {**kwargs, "message": new_message}}
 
-    def _spawn_relocate_task(self, merged_hash: str) -> None:
+    def _restore_replaced_component(self, comp: Dict[str, Any], orig_hash: str) -> Optional[Dict[str, Any]]:
+        """把替换成合成图的组件恢复为原图（二进制与 hash），失败返回 None。"""
+        original_bytes = self._original_bytes.get(orig_hash) if orig_hash else None
+        if original_bytes is None:
+            self.ctx.logger.warning(
+                "[GIF合成] 暂存的原图字节缺失，组件将保持合成图状态 hash=%s",
+                str(comp.get("hash") or "")[:12],
+            )
+            return None
+        restored = dict(comp)
+        restored["binary_data_base64"] = base64.b64encode(original_bytes).decode("ascii")
+        restored["hash"] = orig_hash
+        restored["data"] = ""  # 保持空占位，等待多帧描述回填
+        return restored
+
+    def _spawn_relocate_task(self, merged_hash: str, image_type: str, orig_hash: str) -> None:
         """按合成图 hash 去重后启动描述搬运后台任务。"""
         if merged_hash in self._relocate_tasks:
             return
         self._relocate_tasks.add(merged_hash)
         try:
-            asyncio.get_running_loop().create_task(self._relocate_description(merged_hash))
+            asyncio.get_running_loop().create_task(
+                self._relocate_description(merged_hash, image_type, orig_hash)
+            )
         except RuntimeError:
             self._relocate_tasks.discard(merged_hash)
 
-    async def _relocate_description(self, merged_hash: str) -> None:
-        """等待宿主后台 VLM 完成合成图识别，把多帧描述搬到原图 hash 名下。
+    async def _relocate_description(self, merged_hash: str, image_type: str, orig_hash: str) -> None:
+        """等待宿主 VLM 完成合成图识别，把多帧描述搬到原图/原表情 hash 名下。
 
-        - kind=image：等宿主为原图建好 Images 记录并完成首帧识别（vlm_processed）；
-        - kind=emoji：等 emoji_manager 写入原表情记录后覆盖为多帧描述；
+        - image：等落库流程建好原图记录（替换模式原图不参与宿主识别，
+          记录由 after_process 之后的落库创建）；
+        - emoji：等 emoji_manager 写入原表情记录后覆盖为多帧描述；
         - 超时放弃时行为退化为宿主原生识别（原图/首帧描述），不影响消息链。
         """
-        info = self._ghost_records.pop(merged_hash, None)
         try:
-            if not info:
-                return
-            orig_hash = str(info.get("orig_hash") or "")
-            image_type = str(info.get("kind") or "image")
-            if not orig_hash:
-                return
-
             loop = asyncio.get_running_loop()
             deadline = loop.time() + RELOCATE_TIMEOUT_SECONDS
             while loop.time() < deadline:
-                source = await self._db_get_image_record(merged_hash, "image")
-                if source and source.get("vlm_processed"):
-                    source_desc = str(source.get("description") or "").strip()
-                    if source_desc:
-                        target = await self._db_get_image_record(orig_hash, image_type)
-                        if target is not None and target.get("vlm_processed"):
-                            await self._db_update_description(orig_hash, image_type, source_desc)
-                            self.ctx.logger.info(
-                                "[GIF合成] 多帧动画描述已搬运至原图记录 %s（%s）",
-                                orig_hash[:12],
-                                image_type,
-                            )
-                            return
+                if await self._try_relocate(merged_hash, orig_hash, image_type):
+                    return
                 await asyncio.sleep(RELOCATE_POLL_INTERVAL_SECONDS)
 
             self.ctx.logger.warning(
@@ -411,6 +519,47 @@ class GifStoryboardPlugin(MaiBotPlugin):
             )
         finally:
             self._relocate_tasks.discard(merged_hash)
+
+    async def _try_relocate(self, merged_hash: str, orig_hash: str, image_type: str) -> bool:
+        """尝试搬运一次多帧描述，成功（或已搬运过）返回 True。
+
+        Args:
+            merged_hash: 合成网格图 hash（描述来源）。
+            orig_hash: 原图/原表情 hash（描述落点）。
+            image_type: Images 记录类型（image / emoji）。
+        """
+        source = await self._db_get_image_record(merged_hash, "image")
+        if not (source and source.get("vlm_processed")):
+            return False
+        source_desc = str(source.get("description") or "").strip()
+        if not source_desc:
+            return False
+
+        target = await self._db_get_image_record(orig_hash, image_type)
+        if target is None:
+            return False  # 记录尚未由落库流程创建，下轮轮询再试
+        if str(target.get("description") or "").strip() == source_desc:
+            return True  # 已搬运过（重复轮询/重复触发时直接视为完成）
+
+        await self._db_update_description(orig_hash, image_type, source_desc)
+        self.ctx.logger.info(
+            "[GIF合成] 多帧动画描述已搬运至原图记录 %s（%s）",
+            orig_hash[:12],
+            image_type,
+        )
+        return True
+
+    def _warn_db_unavailable(self, reason: Any) -> None:
+        """数据库能力不可用时只告警一次，避免轮询刷屏。"""
+        if self._db_warned:
+            return
+        self._db_warned = True
+        self.ctx.logger.warning(
+            "[GIF合成] database.query 能力不可用（多帧描述无法搬运回原图，"
+            "视觉识别会退化为只看首帧）：%s。请确认 _manifest.json 的 capabilities "
+            '已声明 "database.query"，并重载插件',
+            reason,
+        )
 
     async def _db_get_image_record(self, image_hash: str, image_type: str) -> Optional[Dict[str, Any]]:
         """按 hash + 类型查询宿主 Images 表记录，兼容不同的返回包装结构。"""
@@ -423,12 +572,13 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 single_result=True,
             )
         except Exception as exc:  # noqa: BLE001 数据库不可达时静默放弃本轮
-            self.ctx.logger.debug("[GIF合成] 查询图片记录失败 hash=%s: %s", image_hash[:12], exc)
+            self._warn_db_unavailable(exc)
             return None
 
         if not isinstance(result, dict):
             return None
         if result.get("success") is False:
+            self._warn_db_unavailable(result.get("error") or "database.query 返回失败")
             return None
         if "description" in result:
             return result
@@ -441,7 +591,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         return None
 
     async def _db_update_description(self, image_hash: str, image_type: str, description: str) -> None:
-        """把多帧描述写入原图 hash 的 Images 记录（保持 vlm_processed=True）。"""
+        """把多帧描述写入原图 hash 的 Images 记录（刷新器即可安全回填，无首帧固化竞态）。"""
         try:
             await self.ctx.db.query(
                 model_name="Images",
@@ -455,8 +605,9 @@ class GifStoryboardPlugin(MaiBotPlugin):
     async def _process_component(self, comp: Any) -> List[Any]:
         """处理单个消息组件，返回替换后的组件列表（bypass 策略可能追加组件）。
 
-        注意：绝不改动组件的 data（content）字段——宿主以 content 非空
-        判定"已识别过"，乱填会让图片跳过视觉模型识别。
+        组件 data（content）默认保持为空、交给宿主视觉链路；唯一例外是
+        多帧描述已就绪的重复 GIF——把已就绪描述直接写入 data，宿主见
+        content 非空跳过识别，planner 上下文立即拿到多帧描述。
         """
         if not isinstance(comp, dict):
             return [comp]
@@ -487,11 +638,21 @@ class GifStoryboardPlugin(MaiBotPlugin):
         if comp_type == "emoji":
             strategy = str(self._opt("merge", "emoji_strategy", "bypass") or "bypass").lower()
             if strategy == "bypass":
+                relocated = await self._lookup_ready_storyboard_description(orig_hash, merged_hash, "emoji")
+                if relocated:
+                    # 该 GIF 的多帧描述此前已搬运就绪：直接写入表情组件文本，
+                    # 宿主对 content 非空的组件跳过识别——零额外识别，
+                    # 也避免重发时缓存命中的旧首帧描述被固化进上下文。
+                    new_comp = dict(comp)
+                    new_comp["data"] = f"[表情包: {relocated}]"
+                    self.ctx.logger.info(
+                        "[GIF合成] 命中已就绪的分镜描述，直接写入表情组件文本 hash=%s", orig_hash[:12]
+                    )
+                    return [new_comp]
                 # 原表情组件原样保留（表情库存原始 GIF，收藏/发送保真），
                 # 追加一个携带合成网格图的 ghost image 组件旁路识别；该组件在
                 # after_process 阶段被回收，多帧描述由后台任务搬到原表情 hash 名下。
                 ghost = self._build_ghost(merged_hash, merged_b64)
-                self._ghost_records[merged_hash] = {"orig_hash": orig_hash, "kind": "emoji"}
                 self.ctx.logger.info(
                     "[GIF合成] 表情包旁路识别：原表情保留，追加合成图 %.1fKB", len(merged) / 1024
                 )
@@ -502,12 +663,53 @@ class GifStoryboardPlugin(MaiBotPlugin):
             new_comp["hash"] = merged_hash
             return [new_comp]
 
-        # image：ghost 模式——原图组件原样保留（落库/WebUI 显示原图），另追加
-        # 携带合成网格图的 ghost 组件；ghost 仅在宿主 process() 识别阶段存在，
-        # after_process 阶段被回收，多帧描述由后台任务搬到原图 hash 名下。
-        ghost = self._build_ghost(merged_hash, merged_b64)
-        self._ghost_records[merged_hash] = {"orig_hash": orig_hash, "kind": "image"}
-        return [comp, ghost]
+        relocated = await self._lookup_ready_storyboard_description(orig_hash, merged_hash, "image")
+        if relocated:
+            # 该 GIF 的多帧描述此前已搬运就绪：直接写入图片组件文本，
+            # 宿主对 content 非空的组件跳过识别——零额外识别，上下文
+            # 立即拿到多帧描述（重发场景无延迟）。
+            new_comp = dict(comp)
+            new_comp["data"] = f"[图片：{relocated}]"
+            self.ctx.logger.info(
+                "[GIF合成] 命中已就绪的分镜描述，直接写入图片组件文本 hash=%s", orig_hash[:12]
+            )
+            return [new_comp]
+
+        # image：替换模式——组件二进制与 hash 暂时替换为合成图，宿主识别的
+        # 就是多帧网格图（识别次数 2→1，且原图记录不存在首帧描述，无固化
+        # 竞态）；after_process 在落库前用暂存的原图字节恢复组件，原图文件
+        # 与图片记录全部保真。替换登记（索引/暂存字节）由 handle_before_process
+        # 的外层循环完成。
+        new_comp = dict(comp)
+        new_comp["binary_data_base64"] = merged_b64
+        new_comp["hash"] = merged_hash
+        self.ctx.logger.info(
+            "[GIF合成] 图片组件已替换为合成图 %.1fKB（落库前恢复原图）", len(merged) / 1024
+        )
+        return [new_comp]
+
+    async def _lookup_ready_storyboard_description(self, orig_hash: str, merged_hash: str, image_type: str) -> str:
+        """若该 GIF 的多帧描述此前已搬运就绪，返回可直接写入组件文本的描述。
+
+        命中条件（全部满足）：
+        - 合成图记录（IMAGE 类型）已完成识别且有非空描述——搬运完成后
+          merged_hash 名下的记录即持久化的多帧描述；同图重发时帧抽样与
+          JPEG 编码确定，merged_hash 一致，可稳定命中；
+        - 原图/原表情记录存在且 no_file_flag=False（文件在库中，跳过识别
+          不会影响落库与展示）。
+
+        未命中返回空字符串，走 ghost + 搬运流程。
+        """
+        merged = await self._db_get_image_record(merged_hash, "image")
+        if not (merged and merged.get("vlm_processed")):
+            return ""
+        description = str(merged.get("description") or "").strip()
+        if not description:
+            return ""
+        target = await self._db_get_image_record(orig_hash, image_type)
+        if target is None or target.get("no_file_flag"):
+            return ""
+        return description
 
     @staticmethod
     def _build_ghost(merged_hash: str, merged_b64: str) -> Dict[str, str]:
@@ -578,7 +780,15 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 return None
 
             count = min(n_frames, max_frames)
-            indices = self._sample_frame_indices(n_frames, count)
+            if bool(self._opt("merge", "adaptive_frames", True)):
+                adaptive = self._adaptive_frame_count(im, n_frames, count)
+                if adaptive != count:
+                    self.ctx.logger.info(
+                        "[GIF合成] 自适应帧数: %d 帧（运动量与源帧数调节，上限 %d）", adaptive, count
+                    )
+                count = max(min_frames, min(count, adaptive))
+
+            indices = self._pick_frame_indices(im, n_frames, count)
 
             frames = []
             for idx in indices:
@@ -602,17 +812,26 @@ class GifStoryboardPlugin(MaiBotPlugin):
             cell_w = max(1, round(cell_w * scale))
             cell_h = max(1, round(cell_h * scale))
 
-        # 顶部说明条：引导视觉模型把网格图理解为"一段动画"而非"一张拼图"
+        # 顶部说明条：极简文案 + 字号自适应，保证任何画布宽度都完整显示
         caption_text = ""
         caption_font = None
         caption_h = 0
         if bool(self._opt("merge", "storyboard_caption", True)):
             canvas_w = cols * cell_w + gap * (cols + 1)
-            caption_font, has_cjk = self._load_caption_font(max(14, min(28, canvas_w // 36)))
-            caption_text = self._caption_text(count, has_cjk)
+            target_w = max(60, canvas_w - gap * 2 - 4)
+            for size in range(18, 11, -2):
+                cand_font, has_cjk = self._load_caption_font(size)
+                cand_text = self._caption_text(count, has_cjk)
+                caption_font, caption_text = cand_font, cand_text
+                try:
+                    bbox = cand_font.getbbox(cand_text)
+                    if (bbox[2] - bbox[0]) <= target_w:
+                        break  # 当前字号能放下，就用它
+                except Exception:
+                    break
             try:
                 bbox = caption_font.getbbox(caption_text)
-                caption_h = (bbox[3] - bbox[1]) + 12
+                caption_h = (bbox[3] - bbox[1]) + 10
             except Exception:
                 caption_h = 0
 
@@ -624,7 +843,8 @@ class GifStoryboardPlugin(MaiBotPlugin):
         draw = ImageDraw.Draw(canvas)
         if caption_h and caption_font is not None:
             draw.text((gap + 2, 4), caption_text, font=caption_font, fill=(17, 17, 17))
-        font = self._load_font(max(12, min(cell_w, cell_h) // 10)) if draw_index else None
+        font = self._load_caption_font(max(14, min(cell_w, cell_h) // 9))[0] if draw_index else None
+        stroke_w = max(1, round(getattr(font, "size", 14) / 10)) if font is not None else 0
 
         for i, frame in enumerate(frames):
             row, col = divmod(i, cols)
@@ -638,7 +858,15 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
             canvas.paste(frame, (x, y), frame)  # 第三参数=alpha 遮罩
             if font is not None:
-                draw.text((x + 4, y + 2), str(i + 1), font=font, fill=(17, 17, 17))
+                # 黑字白描边：浅色/深色背景上都清晰
+                draw.text(
+                    (x + 4, y + 2),
+                    str(i + 1),
+                    font=font,
+                    fill=(17, 17, 17),
+                    stroke_width=stroke_w,
+                    stroke_fill=(255, 255, 255),
+                )
 
         buf = io.BytesIO()
         if output_format == "png":
@@ -672,6 +900,135 @@ class GifStoryboardPlugin(MaiBotPlugin):
             if not indices or idx != indices[-1]:
                 indices.append(idx)
         return indices
+
+    @staticmethod
+    def _frame_sharpness(frame: "Image.Image") -> float:
+        """帧清晰度近似值：灰度边缘强度 RMS，运动模糊帧显著偏低。"""
+        try:
+            edges = frame.convert("L").filter(ImageFilter.FIND_EDGES)
+            return float(sum(ImageStat.Stat(edges).rms))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _dhash(frame: "Image.Image") -> int:
+        """感知哈希（dhash，8x8=64bit）：结构相似的画面之间距离很小。"""
+        small = frame.convert("L").resize((9, 8), Image.LANCZOS)
+        pixels = list(small.getdata())
+        bits = 0
+        for row in range(8):
+            base = row * 9
+            for col in range(8):
+                bits = (bits << 1) | (1 if pixels[base + col] > pixels[base + col + 1] else 0)
+        return bits
+
+    @staticmethod
+    def _hamming(a: int, b: int) -> int:
+        """两个感知哈希的汉明距离。"""
+        return bin(a ^ b).count("1")
+
+    def _adaptive_frame_count(self, im: "Image.Image", n_frames: int, cap: int) -> int:
+        """根据运动量自适应决定实际抽帧数（介于 min_frames 与 cap 之间）。
+
+        粗抽 ≤24 个样本帧，以相邻帧感知哈希（dhash）的平均汉明距离衡量运动量：
+        平均距离 ≤8 视为几乎静止/循环重复（取最少帧数），≥24 视为运动丰富
+        （取最多帧数），中间线性插值。
+        """
+
+        def clamp01(v: float) -> float:
+            return max(0.0, min(1.0, v))
+
+        min_frames = max(2, int(self._opt("merge", "min_frames", 2)))
+        if cap <= min_frames:
+            return cap
+
+        sample_idx = self._sample_frame_indices(n_frames, min(n_frames, 24))
+        dists: List[int] = []
+        prev_dhash = None
+        for idx in sample_idx:
+            try:
+                im.seek(idx)
+                dhash = self._dhash(im)
+            except Exception:
+                continue
+            if prev_dhash is not None:
+                dists.append(self._hamming(prev_dhash, dhash))
+            prev_dhash = dhash
+
+        avg_dist = sum(dists) / len(dists) if dists else 0.0
+        motion = clamp01((avg_dist - 8.0) / 16.0)
+        return min(cap, min_frames + round((cap - min_frames) * motion))
+
+    @classmethod
+    def _pick_frame_indices(cls, im: "Image.Image", n_frames: int, count: int) -> List[int]:
+        """分段清晰度抽帧：首尾帧固定保留，中间时间轴均分 count-2 段。
+
+        每段先取清晰度最高的帧；若它与上一选中帧几乎相同（感知哈希距离过小），
+        改选段内与上一帧差异最大的一帧——让"新元素入画"（如手出现、姿态突变）
+        这类变化帧有机会被保留，而不是连续选中相似姿态。
+
+        等间隔抽帧容易命中快速运动的模糊中间帧，视觉模型对模糊帧的描述
+        常与实际内容偏差很大；清晰度与差异度结合，既保持时序覆盖，
+        又尽量覆盖动画中的每次变化。
+        """
+        if count >= n_frames:
+            return list(range(n_frames))
+        if count < 3:
+            return cls._sample_frame_indices(n_frames, count)
+
+        middle = [
+            c
+            for c in cls._sample_frame_indices(n_frames, min(n_frames - 2, (count - 2) * 3))
+            if 0 < c < n_frames - 1
+        ]
+        if not middle:
+            return cls._sample_frame_indices(n_frames, count)
+
+        try:
+            im.seek(0)
+            prev_dhash = cls._dhash(im)
+        except Exception:
+            prev_dhash = 0
+
+        picked = [0]
+        step = len(middle) / (count - 2)
+        for seg_i in range(count - 2):
+            lo = min(int(round(seg_i * step)), len(middle) - 1)
+            hi = max(min(int(round((seg_i + 1) * step)), len(middle)), lo + 1)
+            best_idx, best_score, best_dhash = middle[lo], -1.0, 0
+            far_idx, far_dist, far_dhash = middle[lo], -1, 0
+            for cand in middle[lo:hi]:
+                try:
+                    im.seek(cand)
+                    gray = im.convert("L")
+                except Exception:
+                    continue
+                score = cls._frame_sharpness(gray)
+                dhash = cls._dhash(gray)
+                dist = cls._hamming(prev_dhash, dhash)
+                if score > best_score:
+                    best_idx, best_score, best_dhash = cand, score, dhash
+                if dist > far_dist:
+                    far_idx, far_dist, far_dhash = cand, dist, dhash
+
+            chosen_idx, chosen_dhash = best_idx, best_dhash
+            if cls._hamming(prev_dhash, best_dhash) < DHASH_DUPLICATE_DISTANCE:
+                # 段内最清晰帧与上一选中帧几乎相同：改选与上一帧差异最大的帧
+                chosen_idx, chosen_dhash = far_idx, far_dhash
+            if chosen_idx != picked[-1]:
+                picked.append(chosen_idx)
+            prev_dhash = chosen_dhash
+        picked.append(n_frames - 1)
+
+        picked = sorted(set(picked))
+        if len(picked) < count:
+            for cand in cls._sample_frame_indices(n_frames, count):
+                if cand not in picked:
+                    picked.append(cand)
+                    if len(picked) >= count:
+                        break
+            picked.sort()
+        return picked[:count]
 
     @staticmethod
     def _load_font(size: int):
@@ -713,16 +1070,10 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
     @staticmethod
     def _caption_text(count: int, has_cjk: bool) -> str:
-        """说明条文案：明确告诉视觉模型这是同一段动画的时序帧，而非一张拼图。"""
+        """说明条文案：极简锚点 + 时序连播提示，帮助视觉模型把跨帧动作连成因果。"""
         if has_cjk:
-            return (
-                f"动图分镜：这是同一段动画按时序抽取的 {count} 帧，"
-                f"请按序号 1→{count} 的顺序把它理解为一个连续的动画过程来描述"
-            )
-        return (
-            f"Storyboard: {count} frames of the SAME GIF animation in chronological order — "
-            f"describe it as one continuous animation, following the numbers"
-        )
+            return f"动图分镜 · 共 {count} 帧（按序号连播）"
+        return f"Storyboard: {count} frames, play in order"
 
     # ── 生命周期 ────────────────────────────────────────────────────────
 
@@ -735,11 +1086,40 @@ class GifStoryboardPlugin(MaiBotPlugin):
             self._opt("merge", "max_frames", 9),
             self._opt("output", "output_format", "jpeg"),
         )
+        await self._check_db_access()
+
+    async def _check_db_access(self) -> None:
+        """启动自检：确认 manifest 的 capabilities 已包含 database.query。
+
+        描述搬运依赖 ``ctx.db``；宿主 AuthorizationManager 只对 manifest 里
+        声明过的能力签发令牌，未声明时所有 ``database.query`` 调用都会被拒绝，
+        插件的视觉增强效果会在"描述回填"这一步静默失效。这里主动探一次，
+        把问题在日志里暴露出来。
+        """
+        try:
+            result = await self.ctx.db.query(
+                model_name="Images",
+                query_type="get",
+                filters={"image_hash": "__gif_storyboard_probe__", "image_type": "image"},
+                limit=1,
+                single_result=True,
+            )
+        except Exception as exc:  # noqa: BLE001 仅做能力可用性提示
+            self._warn_db_unavailable(exc)
+            return
+        if isinstance(result, dict) and result.get("success") is False:
+            self._warn_db_unavailable(result.get("error") or "database.query 返回失败")
+            return
+        self.ctx.logger.info("[GIF合成] 数据库能力自检通过（database.query 可用，描述搬运就绪）")
 
     async def on_unload(self) -> None:
         self._merge_cache.clear()
+        self._original_bytes.clear()
+        self._replaced_index.clear()
+        self._emoji_ghosts.clear()
         self._ghost_records.clear()
         self._relocate_tasks.clear()
+        self._db_warned = False
         self.ctx.logger.info("[GIF合成] 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
