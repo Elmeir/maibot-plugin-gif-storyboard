@@ -4,6 +4,12 @@
 
 全部通过插件 SDK 实现，**不改宿主一行代码**。
 
+- 插件 ID：`github.elmeir.gif-storyboard`
+- 宿主要求：MaiBot ≥ 1.2.4（maibot-plugin-sdk ≥ 2.0）
+- 依赖：Pillow ≥ 10.0.0（自动安装）
+- 作者：[Elmeir](https://github.com/Elmeir) ｜ License：MIT
+- 版本：见 [_manifest.json](_manifest.json)，变更见 [CHANGELOG.md](CHANGELOG.md)
+
 ## 为什么需要它
 
 麦麦收到图片后会调用视觉模型（VLM）生成描述。VLM 链路是：
