@@ -2,19 +2,21 @@
 
 在麦麦把 GIF 动图交给视觉模型之前，把动画各帧按时序抽帧并合成到同一张
 网格静态图上（带帧序号与说明条），让视觉模型看到动画的完整内容与时序，
-而不是只看到第一帧。
+而不是只看到第一帧。只处理普通图片组件（type=image）中的 GIF；
+表情包组件不处理——宿主表情链路原生支持 GIF 抽帧拼接分析，且其
+description 兼作情绪标签来源（逗号分隔标签格式），插件旁路会造成
+双倍解析并覆写标签格式，已废弃。
 
 实现（挂在宿主钩子上，不改宿主一行代码）：
-- ``chat.receive.before_process``：检测 GIF 魔数，多帧动画——图片组件
+- ``chat.receive.before_process``：检测 GIF 魔数，多帧动画的图片组件
   临时替换为合成图（原图字节暂存插件内部登记表，按"组件索引+hash"登记）；
-  表情组件按 emoji_strategy 配置处理（bypass 追加 ghost 组件 / replace / off）；
-- ``chat.receive.after_process``：落库前用暂存字节恢复被替换的组件、
-  回收表情 ghost，并调度后台描述搬运任务；
+- ``chat.receive.after_process``：落库前用暂存字节恢复被替换的组件，
+  并调度后台描述搬运任务；
 - 描述搬运：等宿主 VLM 写出合成图描述后，用 ctx.db 写回原图 hash 的
   Images 记录，宿主视觉占位刷新器自动回填进麦麦上下文；
   同图重发走"已就绪描述快速路径"，宿主直接跳过识别。
 
-只对 GIF 魔数动图动手；任何环节失败一律原样放行，绝不阻塞消息链。
+任何环节失败一律原样放行，绝不阻塞消息链。
 """
 
 import asyncio
@@ -34,9 +36,6 @@ SUPPORTED_CONFIG_VERSION = "1.0.0"
 
 GIF_MAGICS = (b"GIF87a", b"GIF89a")
 """GIF 文件头魔数。"""
-
-MANAGED_COMPONENT_TYPES = ("image", "emoji")
-"""会被处理的组件类型（type 字段）。"""
 
 MERGE_CACHE_MAX_ENTRIES = 64
 """合成结果内存缓存上限（键=原图哈希+参数指纹，超出按最旧淘汰）。"""
@@ -100,25 +99,6 @@ class MergeSectionConfig(PluginConfigBase):
             "hint": "普通图片（type=image）里的 GIF 动图会被合成多帧网格图",
         },
     )
-    emoji_strategy: Literal["bypass", "replace", "off"] = Field(
-        default="bypass",
-        description=(
-            "表情包组件（type=emoji）的处理策略。bypass（推荐）：原表情组件原样保留——表情库存原始"
-            " GIF、可正常收藏与发送；另在消息里追加一个携带合成网格图的图片组件旁路识别，"
-            "视觉模型通过它看全多帧，麦麦的上下文会同时出现 [表情包] 与 [图片: 多帧描述]。"
-            "replace：直接替换表情二进制——识别最直接，但合成图会被宿主落盘表情库"
-            "（data/emoji）甚至被收藏发出，原始 GIF 丢失。off：不处理表情包"
-        ),
-        json_schema_extra={
-            "label": "表情包策略",
-            "options": {
-                "bypass": {"label": "旁路识别（推荐）", "description": "表情库存原始 GIF（保真），另用隐藏合成图让视觉模型看全多帧"},
-                "replace": {"label": "直接替换", "description": "识别最直接，但表情库会存进合成图、可能被收藏发出，原始 GIF 丢失"},
-                "off": {"label": "不处理", "description": "表情包一律原样，识别退回宿主原生行为（GIF 取首帧）"},
-            },
-            "hint": "bypass=保真+多帧识别（推荐）｜replace=会污染表情库｜off=不处理",
-        },
-    )
     max_frames: int = Field(
         default=9,
         ge=2,
@@ -160,7 +140,7 @@ class MergeSectionConfig(PluginConfigBase):
     )
     clean_ghost_components: bool = Field(
         default=True,
-        description="识别完成后恢复原图组件（图片 GIF）并回收表情旁路的 ghost 组件，防止合成图进入聊天记录/WebUI",
+        description="识别完成后把被替换的组件恢复为原图，防止合成图进入聊天记录/WebUI",
         json_schema_extra={
             "label": "落库前恢复原图",
             "hint": "依赖 after_process 钩子 + 描述搬运；关闭后消息会以合成图落库并在 WebUI 中显示九宫格",
@@ -249,10 +229,6 @@ class GifStoryboardPlugin(MaiBotPlugin):
         # 精确恢复被替换的组件。不要把恢复信息写进组件本身——宿主钩子之间
         # 会做序列化往返，组件对象上的未知字段会被丢弃。
         self._replaced_index: "OrderedDict[int, tuple[str, str]]" = OrderedDict()
-        # 表情旁路 ghost（key=合成图 hash -> 原表情 hash）：after_process 回收
-        self._emoji_ghosts: "Dict[str, str]" = {}
-        # 描述搬运映射（key=合成图 hash -> (image_type, 原图/原表情 hash)）
-        self._ghost_records: "Dict[str, tuple[str, str]]" = {}
         # 已在跑的描述搬运任务（按合成图 hash 去重）
         self._relocate_tasks: "set[str]" = set()
         # 数据库能力不可用时的告警去重标志（避免每轮轮询刷屏）
@@ -281,12 +257,8 @@ class GifStoryboardPlugin(MaiBotPlugin):
         return bool(self._opt("plugin", "enabled", True))
 
     def _component_managed(self, comp_type: str) -> bool:
-        """组件类型在当前配置下是否会被处理（image 默认开，emoji 默认 bypass）。"""
-        if comp_type not in MANAGED_COMPONENT_TYPES:
-            return False
-        if comp_type == "image":
-            return bool(self._opt("merge", "process_image", True))
-        return str(self._opt("merge", "emoji_strategy", "bypass") or "bypass").lower() != "off"
+        """组件类型在当前配置下是否会被处理（仅普通图片组件；表情包不处理）。"""
+        return comp_type == "image" and bool(self._opt("merge", "process_image", True))
 
     def _settings_fingerprint(self) -> str:
         """合成参数指纹，参与缓存键：参数变了缓存自动失效。"""
@@ -314,7 +286,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         name="gif_frame_merge",
-        description="把 GIF 动图各帧合成网格图，以 ghost 组件形式交给视觉链路（原图保留）",
+        description="把 GIF 动图各帧合成网格图，临时替换图片组件交给视觉链路（落库前恢复原图）",
         timeout_ms=10000,
         error_policy=ErrorPolicy.SKIP,
     )
@@ -324,7 +296,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         使用 LATE 槽位：排在消息防抖类插件（在 NORMAL 槽阻塞窗口并合并消息）
         之后，看到的是防抖放行后的最终消息——防抖窗口内并入的第 2..N 条消息
         的 GIF 也能被分镜处理，且被防抖 abort 的消息不会再触发本插件
-        （避免登记永远不会被回收的 ghost）。
+        （避免登记永远不会被回收的替换记录）。
         """
         if not self._enabled() or not isinstance(message, dict):
             return {"action": "continue"}
@@ -355,7 +327,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             result_hash = str(result.get("hash") or "").strip()
 
             if len(results) == 1 and comp_hash and result_hash and result_hash != comp_hash:
-                # image 替换模式：按组件索引登记，after_process 据此恢复原图。
+                # 替换模式：按组件索引登记，after_process 据此恢复原图。
                 # 登记信息放在插件内部而非组件字段——宿主钩子间的序列化往返
                 # 会丢弃组件对象上的未知字段。
                 orig_bytes = self._b64_decode(comp.get("binary_data_base64"))
@@ -365,13 +337,6 @@ class GifStoryboardPlugin(MaiBotPlugin):
                     while len(self._original_bytes) > ORIGINAL_BYTES_CACHE_MAX_ENTRIES:
                         self._original_bytes.popitem(last=False)
                 self._replaced_index[idx] = (result_hash, comp_hash)
-                self._ghost_records[result_hash] = ("image", comp_hash)
-            elif len(results) == 2:
-                # 表情 bypass：第二个组件是 ghost，after_process 阶段回收
-                ghost_hash = str(results[1].get("hash") or "").strip()
-                if ghost_hash:
-                    self._emoji_ghosts[ghost_hash] = comp_hash
-                    self._ghost_records[ghost_hash] = ("emoji", comp_hash)
             new_components.extend(results)
 
         # 防御：索引登记只服务于紧随其后的一条消息，避免异常路径残留累积
@@ -390,26 +355,21 @@ class GifStoryboardPlugin(MaiBotPlugin):
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         name="gif_frame_ghost_cleanup",
-        description="回收 GIF 分镜 ghost 组件，防止合成图进入聊天记录，并调度多帧描述搬运",
+        description="落库前恢复被替换的图片组件，防止合成图进入聊天记录，并调度多帧描述搬运",
         timeout_ms=10000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def handle_after_process(self, message: Any = None, **kwargs: Any) -> Dict[str, Any]:
-        """after 钩子：宿主 process() 已完成识别调度，此刻做两件事——
-
-        1. 替换模式：按"组件索引 + hash"精确匹配 before_process 替换过的组件，
-           用暂存的原图字节恢复（二进制与 hash），随后的消息落库按原图 hash
-           保存文件与记录，图片库/WebUI 全部保真；此时原图记录尚未被宿主识别
-           （不存在首帧描述），搬运任务把合成图的多帧描述写到原图 hash 名下
-           后，刷新器即可安全回填；
-        2. 表情 bypass：按 hash 回收追加的 ghost 组件，多帧描述由后台任务搬到
-           原表情 hash 名下。
+        """after 钩子：宿主 process() 已完成识别调度，此刻用 before_process
+        暂存的原图字节按"组件索引 + hash"恢复被替换的组件——随后的消息落库
+        按原图 hash 保存文件与记录，图片库/WebUI 全部保真；此时原图记录尚未被
+        宿主识别（不存在首帧描述），搬运任务把合成图的多帧描述写到原图 hash
+        名下后，刷新器即可安全回填。
         """
         if not isinstance(message, dict):
             return {"action": "continue"}
         if not bool(self._opt("merge", "clean_ghost_components", True)):
             self._replaced_index.clear()
-            self._emoji_ghosts.clear()
             return {"action": "continue"}
 
         components = message.get("raw_message")
@@ -417,7 +377,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             return {"action": "continue"}
 
         kept: List[Any] = []
-        handled: List[tuple[str, str]] = []  # (合成图 hash, 原图/原表情 hash)
+        handled: List[tuple[str, str]] = []  # (合成图 hash, 原图 hash)
         for idx, comp in enumerate(components):
             comp_hash = str(comp.get("hash") or "").strip() if isinstance(comp, dict) else ""
 
@@ -441,21 +401,15 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 handled.append((merged_hash, orig_hash))
                 continue
 
-            if comp_hash and comp_hash in self._emoji_ghosts:
-                orig_hash = self._emoji_ghosts.pop(comp_hash, "")
-                handled.append((comp_hash, orig_hash))
-                continue
-
             kept.append(comp)
 
         if not handled:
             return {"action": "continue"}
 
-        # 恢复/回收全部完成后统一清理暂存的原图字节（同 hash 多组件共用一份）
+        # 恢复全部完成后统一清理暂存的原图字节（同 hash 多组件共用一份）
         for merged_hash, orig_hash in handled:
-            image_type = str(self._ghost_records.pop(merged_hash, ("image", ""))[0] or "image")
             self._original_bytes.pop(orig_hash, None)
-            self._spawn_relocate_task(merged_hash, image_type, orig_hash)
+            self._spawn_relocate_task(merged_hash, orig_hash)
         self.ctx.logger.info(
             "[GIF合成] 已处理 %d 个组件（恢复原图/回收合成图），多帧描述将在后台搬运",
             len(handled),
@@ -480,31 +434,30 @@ class GifStoryboardPlugin(MaiBotPlugin):
         restored["data"] = ""  # 保持空占位，等待多帧描述回填
         return restored
 
-    def _spawn_relocate_task(self, merged_hash: str, image_type: str, orig_hash: str) -> None:
+    def _spawn_relocate_task(self, merged_hash: str, orig_hash: str) -> None:
         """按合成图 hash 去重后启动描述搬运后台任务。"""
         if merged_hash in self._relocate_tasks:
             return
         self._relocate_tasks.add(merged_hash)
         try:
             asyncio.get_running_loop().create_task(
-                self._relocate_description(merged_hash, image_type, orig_hash)
+                self._relocate_description(merged_hash, orig_hash)
             )
         except RuntimeError:
             self._relocate_tasks.discard(merged_hash)
 
-    async def _relocate_description(self, merged_hash: str, image_type: str, orig_hash: str) -> None:
-        """等待宿主 VLM 完成合成图识别，把多帧描述搬到原图/原表情 hash 名下。
+    async def _relocate_description(self, merged_hash: str, orig_hash: str) -> None:
+        """等待宿主 VLM 完成合成图识别，把多帧描述搬到原图 hash 名下。
 
-        - image：等落库流程建好原图记录（替换模式原图不参与宿主识别，
+        - 等落库流程建好原图记录（替换模式原图不参与宿主识别，
           记录由 after_process 之后的落库创建）；
-        - emoji：等 emoji_manager 写入原表情记录后覆盖为多帧描述；
         - 超时放弃时行为退化为宿主原生识别（原图/首帧描述），不影响消息链。
         """
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + RELOCATE_TIMEOUT_SECONDS
             while loop.time() < deadline:
-                if await self._try_relocate(merged_hash, orig_hash, image_type):
+                if await self._try_relocate(merged_hash, orig_hash):
                     return
                 await asyncio.sleep(RELOCATE_POLL_INTERVAL_SECONDS)
 
@@ -516,32 +469,34 @@ class GifStoryboardPlugin(MaiBotPlugin):
         finally:
             self._relocate_tasks.discard(merged_hash)
 
-    async def _try_relocate(self, merged_hash: str, orig_hash: str, image_type: str) -> bool:
+    async def _try_relocate(self, merged_hash: str, orig_hash: str) -> bool:
         """尝试搬运一次多帧描述，成功（或已搬运过）返回 True。
 
         Args:
             merged_hash: 合成网格图 hash（描述来源）。
-            orig_hash: 原图/原表情 hash（描述落点）。
-            image_type: Images 记录类型（image / emoji）。
+            orig_hash: 原图 hash（描述落点）。
+
+        Note:
+            只写 IMAGE 类型记录；EMOJI 记录的 description 兼作情绪标签来源
+            （逗号分隔标签格式），多帧长描述不可覆写。
         """
-        source = await self._db_get_image_record(merged_hash, "image")
+        source = await self._db_get_image_record(merged_hash)
         if not (source and source.get("vlm_processed")):
             return False
         source_desc = str(source.get("description") or "").strip()
         if not source_desc:
             return False
 
-        target = await self._db_get_image_record(orig_hash, image_type)
+        target = await self._db_get_image_record(orig_hash)
         if target is None:
             return False  # 记录尚未由落库流程创建，下轮轮询再试
         if str(target.get("description") or "").strip() == source_desc:
             return True  # 已搬运过（重复轮询/重复触发时直接视为完成）
 
-        await self._db_update_description(orig_hash, image_type, source_desc)
+        await self._db_update_description(orig_hash, source_desc)
         self.ctx.logger.info(
-            "[GIF合成] 多帧动画描述已搬运至原图记录 %s（%s）",
+            "[GIF合成] 多帧动画描述已搬运至原图记录 %s",
             orig_hash[:12],
-            image_type,
         )
         return True
 
@@ -557,13 +512,13 @@ class GifStoryboardPlugin(MaiBotPlugin):
             reason,
         )
 
-    async def _db_get_image_record(self, image_hash: str, image_type: str) -> Optional[Dict[str, Any]]:
-        """按 hash + 类型查询宿主 Images 表记录，兼容不同的返回包装结构。"""
+    async def _db_get_image_record(self, image_hash: str) -> Optional[Dict[str, Any]]:
+        """按 hash 查询宿主 Images 表 IMAGE 记录，兼容不同的返回包装结构。"""
         try:
             result = await self.ctx.db.query(
                 model_name="Images",
                 query_type="get",
-                filters={"image_hash": image_hash, "image_type": image_type},
+                filters={"image_hash": image_hash, "image_type": "image"},
                 limit=1,
                 single_result=True,
             )
@@ -586,20 +541,24 @@ class GifStoryboardPlugin(MaiBotPlugin):
                 return inner[0]
         return None
 
-    async def _db_update_description(self, image_hash: str, image_type: str, description: str) -> None:
-        """把多帧描述写入原图 hash 的 Images 记录（刷新器即可安全回填，无首帧固化竞态）。"""
+    async def _db_update_description(self, image_hash: str, description: str) -> None:
+        """把多帧描述写入原图 hash 的 Images 记录（刷新器即可安全回填，无首帧固化竞态）。
+
+        只写 IMAGE 类型记录；EMOJI 记录的 description 兼作情绪标签来源
+        （逗号分隔标签格式），不可被多帧长描述覆写。
+        """
         try:
             await self.ctx.db.query(
                 model_name="Images",
                 query_type="update",
                 data={"description": description, "vlm_processed": True},
-                filters={"image_hash": image_hash, "image_type": image_type},
+                filters={"image_hash": image_hash, "image_type": "image"},
             )
         except Exception as exc:  # noqa: BLE001 更新失败不影响消息链
             self.ctx.logger.warning("[GIF合成] 更新原图描述失败 hash=%s: %s", image_hash[:12], exc)
 
     async def _process_component(self, comp: Any) -> List[Any]:
-        """处理单个消息组件，返回替换后的组件列表（bypass 策略可能追加组件）。
+        """处理单个消息组件，返回替换后的组件列表。
 
         组件 data（content）默认保持为空、交给宿主视觉链路；唯一例外是
         多帧描述已就绪的重复 GIF——把已就绪描述直接写入 data，宿主见
@@ -631,35 +590,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
         merged_hash = hashlib.sha256(merged).hexdigest()
         orig_hash = str(comp.get("hash") or "").strip() or hashlib.sha256(raw).hexdigest()
 
-        if comp_type == "emoji":
-            strategy = str(self._opt("merge", "emoji_strategy", "bypass") or "bypass").lower()
-            if strategy == "bypass":
-                relocated = await self._lookup_ready_storyboard_description(orig_hash, merged_hash, "emoji")
-                if relocated:
-                    # 该 GIF 的多帧描述此前已搬运就绪：直接写入表情组件文本，
-                    # 宿主对 content 非空的组件跳过识别——零额外识别，
-                    # 也避免重发时缓存命中的旧首帧描述被固化进上下文。
-                    new_comp = dict(comp)
-                    new_comp["data"] = f"[表情包: {relocated}]"
-                    self.ctx.logger.info(
-                        "[GIF合成] 命中已就绪的分镜描述，直接写入表情组件文本 hash=%s", orig_hash[:12]
-                    )
-                    return [new_comp]
-                # 原表情组件原样保留（表情库存原始 GIF，收藏/发送保真），
-                # 追加一个携带合成网格图的 ghost image 组件旁路识别；该组件在
-                # after_process 阶段被回收，多帧描述由后台任务搬到原表情 hash 名下。
-                ghost = self._build_ghost(merged_hash, merged_b64)
-                self.ctx.logger.info(
-                    "[GIF合成] 表情包旁路识别：原表情保留，追加合成图 %.1fKB", len(merged) / 1024
-                )
-                return [comp, ghost]
-            # replace：直接替换表情二进制（合成图会进表情库，由配置自担）
-            new_comp = dict(comp)
-            new_comp["binary_data_base64"] = merged_b64
-            new_comp["hash"] = merged_hash
-            return [new_comp]
-
-        relocated = await self._lookup_ready_storyboard_description(orig_hash, merged_hash, "image")
+        relocated = await self._lookup_ready_storyboard_description(orig_hash, merged_hash)
         if relocated:
             # 该 GIF 的多帧描述此前已搬运就绪：直接写入图片组件文本，
             # 宿主对 content 非空的组件跳过识别——零额外识别，上下文
@@ -671,7 +602,7 @@ class GifStoryboardPlugin(MaiBotPlugin):
             )
             return [new_comp]
 
-        # image：替换模式——组件二进制与 hash 暂时替换为合成图，宿主识别的
+        # 替换模式——组件二进制与 hash 暂时替换为合成图，宿主识别的
         # 就是多帧网格图（识别次数 2→1，且原图记录不存在首帧描述，无固化
         # 竞态）；after_process 在落库前用暂存的原图字节恢复组件，原图文件
         # 与图片记录全部保真。替换登记（索引/暂存字节）由 handle_before_process
@@ -684,38 +615,28 @@ class GifStoryboardPlugin(MaiBotPlugin):
         )
         return [new_comp]
 
-    async def _lookup_ready_storyboard_description(self, orig_hash: str, merged_hash: str, image_type: str) -> str:
+    async def _lookup_ready_storyboard_description(self, orig_hash: str, merged_hash: str) -> str:
         """若该 GIF 的多帧描述此前已搬运就绪，返回可直接写入组件文本的描述。
 
         命中条件（全部满足）：
         - 合成图记录（IMAGE 类型）已完成识别且有非空描述——搬运完成后
           merged_hash 名下的记录即持久化的多帧描述；同图重发时帧抽样与
           JPEG 编码确定，merged_hash 一致，可稳定命中；
-        - 原图/原表情记录存在且 no_file_flag=False（文件在库中，跳过识别
+        - 原图记录存在且 no_file_flag=False（文件在库中，跳过识别
           不会影响落库与展示）。
 
-        未命中返回空字符串，走 ghost + 搬运流程。
+        未命中返回空字符串，走替换 + 搬运流程。
         """
-        merged = await self._db_get_image_record(merged_hash, "image")
+        merged = await self._db_get_image_record(merged_hash)
         if not (merged and merged.get("vlm_processed")):
             return ""
         description = str(merged.get("description") or "").strip()
         if not description:
             return ""
-        target = await self._db_get_image_record(orig_hash, image_type)
+        target = await self._db_get_image_record(orig_hash)
         if target is None or target.get("no_file_flag"):
             return ""
         return description
-
-    @staticmethod
-    def _build_ghost(merged_hash: str, merged_b64: str) -> Dict[str, str]:
-        """构造携带合成网格图的 ghost 组件（content 留空交给宿主视觉链路）。"""
-        return {
-            "type": "image",
-            "data": "",
-            "hash": merged_hash,
-            "binary_data_base64": merged_b64,
-        }
 
     @staticmethod
     def _is_gif(data: bytes) -> bool:
@@ -1075,10 +996,9 @@ class GifStoryboardPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self.ctx.logger.info(
-            "[GIF合成] 插件已加载 | 总开关: %s | 处理图片: %s | 表情包策略: %s | 最多 %s 帧 | 输出: %s",
+            "[GIF合成] 插件已加载 | 总开关: %s | 处理图片: %s | 最多 %s 帧 | 输出: %s",
             self._enabled(),
             bool(self._opt("merge", "process_image", True)),
-            self._opt("merge", "emoji_strategy", "bypass"),
             self._opt("merge", "max_frames", 9),
             self._opt("output", "output_format", "jpeg"),
         )
@@ -1112,8 +1032,6 @@ class GifStoryboardPlugin(MaiBotPlugin):
         self._merge_cache.clear()
         self._original_bytes.clear()
         self._replaced_index.clear()
-        self._emoji_ghosts.clear()
-        self._ghost_records.clear()
         self._relocate_tasks.clear()
         self._db_warned = False
         self.ctx.logger.info("[GIF合成] 插件已卸载")

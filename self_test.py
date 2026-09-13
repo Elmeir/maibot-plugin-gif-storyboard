@@ -1,9 +1,8 @@
 """GIF 动图帧合成插件本地自检脚本。
 
 不依赖宿主：用假的 maibot_sdk 模块加载 plugin.py，
-覆盖多帧合成、单帧/非 GIF 放行、缓存命中、钩子改写路径、
-表情包三种策略（bypass 旁路识别 / replace 直接替换 / off 不处理），
-以及 after_process 回收与"多帧描述搬运"（含 database.query 故障告警、
+覆盖多帧合成、单帧/非 GIF/emoji 组件放行、缓存命中、钩子改写路径、
+以及 after_process 恢复原图与"多帧描述搬运"（含 database.query 故障告警、
 超时兜底）逻辑。
 
 用法：
@@ -243,7 +242,6 @@ def main() -> int:
         and plugin_module.GifStoryboardPlugin._is_gif(pl._original_bytes.get(comp["hash"], b"")),
     )
     check("替换按组件索引登记", pl._replaced_index.get(0) == (new_comp["hash"], comp["hash"]))
-    check("搬运映射登记", pl._ghost_records.get(new_comp["hash"]) == ("image", comp["hash"]))
 
     # ── 2. 12 帧均匀抽样 9 帧：应含首尾帧 ──
     idx = plugin_module.GifStoryboardPlugin._sample_frame_indices(12, 9)
@@ -266,31 +264,11 @@ def main() -> int:
     same_empty = asyncio.run(pl._process_component(empty_comp))
     check("缺 binary_data_base64 时放行", same_empty == [empty_comp])
 
-    # ── 6. emoji 组件三种策略 ──
+    # ── 6. emoji 组件不处理（宿主表情链路原生支持 GIF 多帧分析，且其
+    # description 兼作情绪标签来源，插件旁路会覆写标签格式） ──
     emoji_comp = component_for(gif_12, comp_type="emoji")
-
-    # bypass（默认）：原表情保留 + 追加合成图 image 组件
-    bypass = asyncio.run(pl._process_component(emoji_comp))
-    check("bypass：原表情组件原样保留", len(bypass) == 2 and bypass[0] is emoji_comp)
-    ghost = bypass[1]
-    check("bypass：追加的是 image 组件且 content 为空", ghost.get("type") == "image" and ghost.get("data", "") == "")
-    check("bypass：合成图与 image 链路结果一致", ghost.get("binary_data_base64") == merged_b64)
-    check("bypass：追加组件带新 hash", ghost.get("hash") == hashlib.sha256(merged).hexdigest())
-
-    # replace：直接替换表情二进制
-    pl.config.merge.emoji_strategy = "replace"
-    replaced = asyncio.run(pl._process_component(emoji_comp))
-    check(
-        "replace：表情二进制被替换",
-        len(replaced) == 1 and replaced[0] is not emoji_comp and replaced[0].get("type") == "emoji",
-    )
-    check("replace：替换后不再是 GIF 魔数", not plugin_module.GifStoryboardPlugin._is_gif(base64.b64decode(replaced[0]["binary_data_base64"])))
-
-    # off：不处理
-    pl.config.merge.emoji_strategy = "off"
-    off = asyncio.run(pl._process_component(emoji_comp))
-    check("off：表情组件放行", off == [emoji_comp])
-    pl.config.merge.emoji_strategy = "bypass"
+    untouched = asyncio.run(pl._process_component(emoji_comp))
+    check("emoji 组件不处理（原样放行）", untouched == [emoji_comp])
 
     # ── 7. 缓存命中：同图二次合成直接复用 ──
     cache_size = len(pl._merge_cache)
@@ -315,7 +293,7 @@ def main() -> int:
     modified = result.get("modified_kwargs", {}).get("message", {})
     comps = modified.get("raw_message", [])
     check("钩子返回 modified_kwargs", bool(result.get("modified_kwargs")))
-    check("图片替换、表情追加 ghost → 4+1=5", len(comps) == 5, f"实际 {len(comps)}")
+    check("仅图片组件被替换 → 组件数不变（4）", len(comps) == 4, f"实际 {len(comps)}")
     check("文本组件原样保留", comps[0] == message["raw_message"][0])
     check("GIF 图片组件被替换为合成图", (
         comps[1] is not message["raw_message"][1]
@@ -323,11 +301,8 @@ def main() -> int:
         and comps[1].get("data", "") == ""
     ))
     check("emoji 原组件原样保留", comps[2] is message["raw_message"][2])
-    check("emoji 之后是追加的 ghost 合成图", comps[3].get("hash") == new_comp["hash"])
-    check("PNG 组件原样保留", comps[4] is message["raw_message"][3])
+    check("PNG 组件原样保留", comps[3] is message["raw_message"][3])
     check("替换按组件索引登记（idx=1）", pl._replaced_index.get(1) == (comps[1]["hash"], comp["hash"]))
-    check("表情 ghost 按 hash 登记", pl._emoji_ghosts.get(comps[3]["hash"]) == comp["hash"])
-    check("搬运映射登记（emoji）", pl._emoji_ghosts and pl._ghost_records.get(comps[3]["hash"]) == ("emoji", comp["hash"]))
 
     # ── 9. 纯文本消息：钩子直接放行 ──
     text_only = {"message_id": "m2", "session_id": "s1", "raw_message": [{"type": "text", "data": "hi"}]}
@@ -340,12 +315,10 @@ def main() -> int:
     check("总开关关闭时不改写", "modified_kwargs" not in res3)
     pl.config.plugin.enabled = True
 
-    # ── 11. 表情策略 off：含 emoji 的消息不再触发 emoji 改写 ──
-    pl.config.merge.emoji_strategy = "off"
+    # ── 11. 纯 emoji 消息：不触发改写 ──
     emoji_only = {"message_id": "m3", "session_id": "s1", "raw_message": [component_for(gif_12, comp_type="emoji")]}
     res4 = asyncio.run(pl.handle_before_process(message=emoji_only))
-    check("off 策略下纯 emoji 消息不触发改写", "modified_kwargs" not in res4)
-    pl.config.merge.emoji_strategy = "bypass"
+    check("纯 emoji 消息不触发改写", "modified_kwargs" not in res4)
 
     # ── 12. 抽样帧数上限与参数指纹 ──
     fp_before = pl._settings_fingerprint()
@@ -357,11 +330,11 @@ def main() -> int:
     check("max_frames=4 时 20 帧 GIF 仍可合成", comp_4 is not None)
     pl.config.merge.max_frames = 9
 
-    # ── 13. after_process：恢复原图组件 + 回收 ghost + 调度搬运 ──
+    # ── 13. after_process：恢复原图组件 + 调度搬运 ──
     db = pl.ctx.db
     spawn_calls: list[str] = []
     pl._spawn_relocate_task = (
-        lambda merged_hash, image_type, orig_hash: spawn_calls.append(merged_hash)
+        lambda merged_hash, orig_hash: spawn_calls.append(merged_hash)
         if merged_hash not in spawn_calls
         else None
     )  # noqa: E731
@@ -369,25 +342,22 @@ def main() -> int:
     after_res = asyncio.run(pl.handle_after_process(message=after_msg))
     kept = after_res.get("modified_kwargs", {}).get("message", {}).get("raw_message", [])
     check("after_process 返回 modified_kwargs", bool(after_res.get("modified_kwargs")))
-    check("恢复原图 + 回收 ghost → 4 组件", len(kept) == 4, f"实际 {len(kept)}")
+    check("恢复原图 → 4 组件", len(kept) == 4, f"实际 {len(kept)}")
     check("组件已恢复为原图（二进制与 hash）", (
         kept[1].get("hash") == comp["hash"]
         and base64.b64decode(kept[1]["binary_data_base64"]) == gif_12
         and kept[1].get("data", "") == ""
     ))
     check("替换索引已消费", 1 not in pl._replaced_index)
-    check("ghost 登记已消费", new_comp["hash"] not in pl._emoji_ghosts)
     check("恢复后原图字节缓存清理", comp["hash"] not in pl._original_bytes)
-    check("after 后搬运映射已消费", new_comp["hash"] not in pl._ghost_records)
     check("恢复后调度了搬运任务（同 hash 去重）", set(spawn_calls) == {new_comp["hash"]}, str(spawn_calls))
 
     # ── 14. 描述搬运：合成图识别就绪且原图记录存在 → 覆盖写入 ──
     merged_hash = new_comp["hash"]
     orig_hash = str(comp["hash"])
-    pl._ghost_records[merged_hash] = ("image", orig_hash)
     db.put(merged_hash, "image", description="一张多帧动画分镜……", vlm_processed=True)
     db.put(orig_hash, "image", description="", vlm_processed=False)  # 落库建的干净记录
-    asyncio.run(pl._relocate_description(merged_hash, "image", orig_hash))
+    asyncio.run(pl._relocate_description(merged_hash, orig_hash))
     check(
         "搬运成功：原图记录被覆盖为多帧描述",
         db.records[(orig_hash, "image")]["description"] == "一张多帧动画分镜……",
@@ -402,14 +372,13 @@ def main() -> int:
     db.put(merged2, "image", description="多帧描述 B", vlm_processed=True)
     check(
         "原图记录缺失时不写入",
-        asyncio.run(pl._try_relocate(merged2, orig2, "image")) is False,
+        asyncio.run(pl._try_relocate(merged2, orig2)) is False,
     )
     db.put(orig2, "image", description="", vlm_processed=False)  # 落库完成
     check("原图记录就绪后写入多帧描述", (
-        asyncio.run(pl._try_relocate(merged2, orig2, "image")) is True
+        asyncio.run(pl._try_relocate(merged2, orig2)) is True
         and db.records[(orig2, "image")]["description"] == "多帧描述 B"
     ))
-    pl._ghost_records[merged2] = ("image", orig2)
     old_timeout, old_interval = (
         plugin_module.RELOCATE_TIMEOUT_SECONDS,
         plugin_module.RELOCATE_POLL_INTERVAL_SECONDS,
@@ -418,7 +387,7 @@ def main() -> int:
     plugin_module.RELOCATE_POLL_INTERVAL_SECONDS = 0.01
     try:
         db.records.pop((orig2, "image"), None)  # 模拟记录始终缺失
-        asyncio.run(pl._relocate_description(merged2, "image", orig2))
+        asyncio.run(pl._relocate_description(merged2, orig2))
         check("记录缺失时搬运超时告警", any("搬运超时放弃" in t for t in pl.ctx.logger.texts("warning")))
     finally:
         plugin_module.RELOCATE_TIMEOUT_SECONDS = old_timeout
@@ -429,8 +398,8 @@ def main() -> int:
     db.updates.clear()
     db.raise_error = RuntimeError("插件 github.elmeir.gif-storyboard 未获授权能力: database.query")
     pl._db_warned = False
-    r1 = asyncio.run(pl._db_get_image_record("x" * 64, "image"))
-    r2 = asyncio.run(pl._db_get_image_record("y" * 64, "image"))
+    r1 = asyncio.run(pl._db_get_image_record("x" * 64))
+    r2 = asyncio.run(pl._db_get_image_record("y" * 64))
     warn_once = [t for t in pl.ctx.logger.texts("warning") if "database.query 能力不可用" in t]
     check("db 故障时返回 None", r1 is None and r2 is None)
     check("db 故障告警去重（仅一次）", len(warn_once) == 1, f"实际 {len(warn_once)} 次")
@@ -448,21 +417,16 @@ def main() -> int:
     db.raise_error = None
 
     # ── 18. on_unload 清理运行态 ──
-    pl._ghost_records["z" * 64] = "w" * 64
     pl._replaced_index[99] = ("y" * 64, "x" * 64)
-    pl._emoji_ghosts["v" * 64] = "u" * 64
     asyncio.run(pl.on_unload())
     check(
         "卸载后运行态被清空",
-        not pl._ghost_records
-        and not pl._relocate_tasks
+        not pl._relocate_tasks
         and not pl._original_bytes
-        and not pl._replaced_index
-        and not pl._emoji_ghosts,
+        and not pl._replaced_index,
     )
 
     # ── 19. 重复 GIF 快速路径：多帧描述已就绪时直接写入组件文本 ──
-    pl._ghost_records.clear()
     pl._relocate_tasks.clear()
     fast_gif = make_gif(6)
     fast_comp = component_for(fast_gif)
@@ -488,13 +452,6 @@ def main() -> int:
     check(
         "原图记录缺失时退回替换流程",
         len(fallback) == 1 and fallback[0].get("hash") != orig_fast_hash,
-    )
-    emoji_fast_comp = component_for(fast_gif, comp_type="emoji")
-    db.put(orig_fast_hash, "emoji", description="", vlm_processed=True)
-    emoji_fast = asyncio.run(pl._process_component(emoji_fast_comp))
-    check(
-        "emoji 快速路径写入多帧描述",
-        len(emoji_fast) == 1 and emoji_fast[0].get("data") == "[表情包: 多帧描述 D]",
     )
 
     # ── 20. 自适应帧数 + 分段清晰度抽帧 ──

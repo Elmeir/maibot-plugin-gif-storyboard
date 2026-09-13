@@ -8,12 +8,8 @@ config_version = "1.0.0"  # 勿改
 
 [merge]
 process_image = true      # 处理普通图片组件（type=image）中的 GIF 动图
-emoji_strategy = "bypass" # 表情包组件（type=emoji）策略：
-                          #   bypass（推荐）= 原表情保留（表情库存原始 GIF，收藏/发送保真），
-                          #                  另追加合成图组件旁路识别，VLM 能看全多帧；
-                          #   replace = 直接替换表情二进制，识别最直接，但合成图会落盘表情库
-                          #             （data/emoji）甚至被收藏发出，原始 GIF 丢失；
-                          #   off     = 不处理表情包，识别退回宿主原生行为（GIF 取首帧）
+                          # 注：表情包组件（type=emoji）不处理——宿主表情链路原生支持
+                          #     GIF 抽帧拼接分析，插件旁路会双倍解析并覆写其情绪标签格式
 max_frames = 9            # 最多抽取的帧数（按时序均匀抽样，9 = 3x3 网格）；帧越多图越大、token 越贵
 min_frames = 2            # 动画至少包含多少帧才触发合成；单帧 GIF 等价静态图，直接放行
 draw_frame_index = true   # 在每帧左上角绘制序号（1、2、3…），帮助视觉模型理解播放顺序
