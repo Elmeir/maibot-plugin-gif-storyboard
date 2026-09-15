@@ -1,6 +1,9 @@
 # 运行时产物（Runner 自动生成，属用户数据，不入库）
 config.toml
 
+# 开发侧自检脚本（非运行时，不入库）
+self_test.py
+
 __pycache__/
 *.pyc
 # 本地测试素材与预览产物  
